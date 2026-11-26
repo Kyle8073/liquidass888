@@ -95,14 +95,16 @@
     if (self.navigationController.topViewController != self) return;
     if (!surface.length) return;
 
+    __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self.navigationController.topViewController != self) return;
-        if ([surface isEqualToString:@"Surfaces"]) [self openSurfaces];
-        else if ([surface isEqualToString:@"Homescreen"]) [self openHomescreen];
-        else if ([surface isEqualToString:@"Lockscreen"]) [self openLockscreen];
-        else if ([surface isEqualToString:@"AppLibrary"]) [self openAppLibrary];
-        else if ([surface isEqualToString:@"MoreOptions"]) [self openMoreOptions];
-        else if ([surface isEqualToString:@"PrefsSettings"]) [self openPrefsSettings];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.navigationController.topViewController != strongSelf) return;
+        if ([surface isEqualToString:@"Surfaces"]) [strongSelf openSurfaces];
+        else if ([surface isEqualToString:@"Homescreen"]) [strongSelf openHomescreen];
+        else if ([surface isEqualToString:@"Lockscreen"]) [strongSelf openLockscreen];
+        else if ([surface isEqualToString:@"AppLibrary"]) [strongSelf openAppLibrary];
+        else if ([surface isEqualToString:@"MoreOptions"]) [strongSelf openMoreOptions];
+        else if ([surface isEqualToString:@"PrefsSettings"]) [strongSelf openPrefsSettings];
     });
 }
 
@@ -262,11 +264,13 @@
     toggle.onTintColor = [UIColor systemBlueColor];
     toggle.on = [self isGlobalEnabled];
     self.lg_globalToggle = toggle;
+    __weak typeof(self) weakSelf = self;
     [toggle addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
         UISwitch *sender = (UISwitch *)action.sender;
         LGWritePreferenceAndMaybeRequireRespring(@"Global.Enabled", @(sender.isOn));
-        [self updateMenuAvailability];
-        [self updateRespringBarAnimated:YES];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf updateMenuAvailability];
+        [strongSelf updateRespringBarAnimated:YES];
     }] forControlEvents:UIControlEventValueChanged];
 
     UIView *headerRow = [[UIView alloc] initWithFrame:CGRectZero];
@@ -466,7 +470,7 @@
     subtitleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
     subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.forward"]];
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     chevron.tintColor = [UIColor tertiaryLabelColor];
     chevron.contentMode = UIViewContentModeScaleAspectFit;

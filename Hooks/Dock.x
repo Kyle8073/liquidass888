@@ -11,6 +11,7 @@ typedef NS_ENUM(NSInteger, LGDockMode) {
 };
 
 static const void *kDockHomeButtonBorderKey = &kDockHomeButtonBorderKey;
+extern BOOL LGDebugLoggingEnabled(void);
 
 static BOOL dockInsideCategoryStackBackground(UIView *view) {
     for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
@@ -21,24 +22,32 @@ static BOOL dockInsideCategoryStackBackground(UIView *view) {
 }
 
 static LGDockMode dockModeForMaterial(UIView *material) {
+    if (!isExactClass(material, @"MTMaterialView")) return LGDockModeNone;
+
+    CGSize size = material.bounds.size;
+    BOOL debug = LGDebugLoggingEnabled();
+    if (size.width < 160.0 || size.height < 40.0) {
+        if (debug) {
+            BOOL regular = hasAncestorOfClassName(material, @"SBDockView");
+            BOOL floating = hasAncestorOfClassName(material, @"SBFloatingDockPlatterView");
+            if (regular || floating)
+                LGLog(@"[Dock] rejected size=%.1fx%.1f", size.width, size.height);
+        }
+        return LGDockModeNone;
+    }
+
     // each dock family exposes different host geometry
     BOOL regular = hasAncestorOfClassName(material, @"SBDockView");
     BOOL floating = hasAncestorOfClassName(material, @"SBFloatingDockPlatterView");
-    BOOL exact = isExactClass(material, @"MTMaterialView");
+    if (!regular && !floating) return LGDockModeNone;
+
     BOOL stacked = dockInsideCategoryStackBackground(material);
-    if (regular || floating)
-        LGLog(@"[Dock] candidate class=%@ frame=%@ bounds=%@ scale=%.1f regular=%d floating=%d exact=%d stacked=%d",
+    if (debug)
+        LGLog(@"[Dock] candidate class=%@ frame=%@ bounds=%@ scale=%.1f regular=%d floating=%d exact=1 stacked=%d",
               NSStringFromClass(material.class), NSStringFromCGRect(material.frame),
               NSStringFromCGRect(material.bounds), material.window.screen.scale,
-              regular, floating, exact, stacked);
-    if (!exact || stacked) return LGDockModeNone;
-
-    CGSize size = material.bounds.size;
-    if (size.width < 160.0 || size.height < 40.0) {
-        if (regular || floating)
-            LGLog(@"[Dock] rejected size=%.1fx%.1f", size.width, size.height);
-        return LGDockModeNone;
-    }
+              regular, floating, stacked);
+    if (stacked) return LGDockModeNone;
 
     if (floating && size.width >= size.height * 2.0) {
         return LGDockModeFloating;
@@ -61,7 +70,7 @@ static void dockUpdateHomeButtonBorder(LGLiveBackdropView *glass,
     if (!needsBorder) {
         [border removeFromSuperlayer];
         objc_setAssociatedObject(glass, kDockHomeButtonBorderKey, nil,
-                                 OBJC_ASSOCIATION_ASSIGN);
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
     if (!border) {
@@ -72,9 +81,14 @@ static void dockUpdateHomeButtonBorder(LGLiveBackdropView *glass,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    [glass.layer addSublayer:border];
+    if (border.superlayer != glass.layer) [glass.layer addSublayer:border];
     CGFloat scale = glass.window.screen.scale;
     if (scale <= 0.0) scale = UIScreen.mainScreen.scale;
+    if (CGRectEqualToRect(border.frame, glass.bounds) &&
+        fabs(border.contentsScale - scale) < 0.01 &&
+        border.path != NULL) {
+        return;
+    }
     CGFloat lineWidth = 1.0 / MAX(scale, 1.0);
     CGRect borderRect = CGRectInset(glass.bounds, lineWidth * 0.5,
                                     lineWidth * 0.5);
@@ -94,9 +108,11 @@ static void configureDockGlass(UIView *material, LGLiveBackdropView *glass) {
                           !dockIsFullScreenPhone(material);
     glass.lgSpecularEnabledOverride = homeButtonDock ? @NO : nil;
     dockUpdateHomeButtonBorder(glass, homeButtonDock);
-    LGLog(@"[Dock] injected mode=%ld homeButton=%d material=%@ glass=%@",
-          (long)mode, homeButtonDock, NSStringFromCGRect(material.bounds),
-          NSStringFromCGRect(glass.frame));
+    if (LGDebugLoggingEnabled()) {
+        LGLog(@"[Dock] injected mode=%ld homeButton=%d material=%@ glass=%@",
+              (long)mode, homeButtonDock, NSStringFromCGRect(material.bounds),
+              NSStringFromCGRect(glass.frame));
+    }
 }
 
 %ctor {

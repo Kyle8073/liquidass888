@@ -50,6 +50,9 @@ static const void *kLGKeyboardVisualEffectSuppressingHiddenKey =
 static const void *kLGKeyboardVisualEffectRequestedHiddenKey =
     &kLGKeyboardVisualEffectRequestedHiddenKey;
 static const void *kLGKeyboardBorderKey = &kLGKeyboardBorderKey;
+static const void *kLGKeyboardContainerClipsKey = &kLGKeyboardContainerClipsKey;
+static const void *kLGKeyboardContainerMasksKey = &kLGKeyboardContainerMasksKey;
+extern BOOL LGDebugLoggingEnabled(void);
 static NSHashTable<UIView *> *gLGKeyboardBackdrops;
 static NSHashTable<UIView *> *gLGKeyboardVisualEffects;
 static NSUInteger gLGKeyboardBackdropLogCount;
@@ -121,7 +124,7 @@ static BOOL LGKeyboardNeedsTopReserve(void) {
 }
 
 static CGSize LGKeyboardReserveSize(CGSize size) {
-    if (LGKeyboardNeedsTopReserve() && size.height > 1.0) {
+    if (LGKeyboardNeedsTopReserve() && size.height >= 150.0) {
 
         size.height += LGKeyboardTopOverhang();
     }
@@ -277,7 +280,7 @@ static void LGKeyboardSetStockHidden(UIView *stock, BOOL hidden) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     stock.hidden = hidden;
     objc_setAssociatedObject(stock, kLGKeyboardSuppressingHiddenKey, nil,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void LGRemoveKeyboardGlass(UIView *stock) {
@@ -285,7 +288,22 @@ static void LGRemoveKeyboardGlass(UIView *stock) {
         objc_getAssociatedObject(stock, kLGKeyboardGlassKey);
     [glass removeFromSuperview];
     objc_setAssociatedObject(stock, kLGKeyboardGlassKey, nil,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UIView *container = stock.superview;
+    if (container) {
+        NSNumber *savedClips = objc_getAssociatedObject(container, kLGKeyboardContainerClipsKey);
+        if (savedClips) {
+            container.clipsToBounds = savedClips.boolValue;
+            objc_setAssociatedObject(container, kLGKeyboardContainerClipsKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        NSNumber *savedMasks = objc_getAssociatedObject(container, kLGKeyboardContainerMasksKey);
+        if (savedMasks) {
+            container.layer.masksToBounds = savedMasks.boolValue;
+            objc_setAssociatedObject(container, kLGKeyboardContainerMasksKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
     LGKeyboardSetStockHidden(
         stock,
         [objc_getAssociatedObject(stock, kLGKeyboardRequestedHiddenKey)
@@ -334,13 +352,18 @@ static void LGUpdateKeyboardBorder(LGLiveBackdropView *glass) {
         objc_setAssociatedObject(glass, kLGKeyboardBorderKey, border,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    [glass.layer addSublayer:border];
+    if (border.superlayer != glass.layer) [glass.layer addSublayer:border];
     CGFloat scale = glass.window.screen.scale;
     if (scale <= 0.0) scale = UIScreen.mainScreen.scale;
     CGFloat lineWidth = 1.0 / MAX(scale, 1.0);
+    CGFloat radius = MAX(0.0, glass.layer.cornerRadius - lineWidth * 0.5);
+    if (CGRectEqualToRect(border.frame, glass.bounds) &&
+        fabs(border.contentsScale - scale) < 0.01 &&
+        border.path != NULL) {
+        return;
+    }
     CGRect borderRect = CGRectInset(glass.bounds, lineWidth * 0.5,
                                     lineWidth * 0.5);
-    CGFloat radius = MAX(0.0, glass.layer.cornerRadius - lineWidth * 0.5);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     border.frame = glass.bounds;
@@ -408,15 +431,27 @@ static void LGUpdateKeyboardGlass(UIView *stock) {
             (hasPredictionStrip ? 0.0 : LGKeyboardTopOverhang()) -
             CGRectGetHeight(primary.bounds);
     }
-    mergedFrame.size.height += 75.0;
+    if (container.window &&
+        CGRectGetMaxY([container convertRect:mergedFrame toView:container.window]) >=
+            CGRectGetHeight(container.window.bounds) - 24.0) {
+        mergedFrame.size.height += 75.0;
+    }
     if (!hasPredictionStrip) {
+        if (!objc_getAssociatedObject(container, kLGKeyboardContainerClipsKey)) {
+            objc_setAssociatedObject(container, kLGKeyboardContainerClipsKey,
+                                     @(container.clipsToBounds),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(container, kLGKeyboardContainerMasksKey,
+                                     @(container.layer.masksToBounds),
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         container.clipsToBounds = NO;
         container.layer.masksToBounds = NO;
 
         LGKeyboardScheduleKeyplaneRefresh();
     }
 
-    if (gLGKeyboardBackdropLogCount++ < 4) {
+    if (LGDebugLoggingEnabled() && gLGKeyboardBackdropLogCount++ < 4) {
         LGLog(@"[keyboard] backdrop merge count=%lu prediction=%d primary=%p container=%@ merged=%@ members=[%@]",
               (unsigned long)backdrops.count, hasPredictionStrip, primary,
               NSStringFromClass(container.class), NSStringFromCGRect(mergedFrame),
@@ -439,13 +474,15 @@ static void LGUpdateKeyboardGlass(UIView *stock) {
         [container addSubview:glass];
     }
 
-    glass.frame = mergedFrame;
-    glass.layer.cornerRadius = LGKeyboardCornerRadius();
-    glass.layer.masksToBounds = YES;
-    glass.lgShapeCornerRadius = LGKeyboardCornerRadius();
-    glass.lgShapeRect = glass.bounds;
+    if (!CGRectEqualToRect(glass.frame, mergedFrame)) glass.frame = mergedFrame;
+    CGFloat radius = LGKeyboardCornerRadius();
+    if (fabs(glass.layer.cornerRadius - radius) > 0.01) glass.layer.cornerRadius = radius;
+    if (!glass.layer.masksToBounds) glass.layer.masksToBounds = YES;
+    if (fabs(glass.lgShapeCornerRadius - radius) > 0.01) glass.lgShapeCornerRadius = radius;
+    if (!CGRectEqualToRect(glass.lgShapeRect, glass.bounds)) glass.lgShapeRect = glass.bounds;
     if (@available(iOS 13.0, *)) {
-        glass.layer.cornerCurve = kCACornerCurveContinuous;
+        if (glass.layer.cornerCurve != kCACornerCurveContinuous)
+            glass.layer.cornerCurve = kCACornerCurveContinuous;
     }
     LGUpdateKeyboardBorder(glass);
     glass.alpha = primary.alpha;
@@ -465,7 +502,7 @@ static void LGKeyboardSetVisualEffectHidden(UIView *effectView, BOOL hidden) {
     effectView.hidden = hidden;
     objc_setAssociatedObject(effectView,
                              kLGKeyboardVisualEffectSuppressingHiddenKey,
-                             nil, OBJC_ASSOCIATION_ASSIGN);
+                             nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void LGUpdateKeyboardVisualEffect(UIView *effectView) {
@@ -611,10 +648,12 @@ static void LGUpdateKeyboardVisualEffect(UIView *effectView) {
 + (CGSize)sizeForInterfaceOrientation:(NSInteger)orientation
                       ignoreInputView:(BOOL)ignoreInputView {
     BOOL outermost = gLGKeyboardSizingDepth++ == 0;
-
-    CGSize size = %orig(orientation, ignoreInputView);
-
-    gLGKeyboardSizingDepth--;
+    CGSize size = CGSizeZero;
+    @try {
+        size = %orig(orientation, ignoreInputView);
+    } @finally {
+        gLGKeyboardSizingDepth--;
+    }
 
     if (outermost) {
         size = LGKeyboardReserveSize(size);
@@ -625,10 +664,12 @@ static void LGUpdateKeyboardVisualEffect(UIView *effectView) {
 
 - (CGSize)intrinsicContentSize {
     BOOL outermost = gLGKeyboardSizingDepth++ == 0;
-
-    CGSize size = %orig;
-
-    gLGKeyboardSizingDepth--;
+    CGSize size = CGSizeZero;
+    @try {
+        size = %orig;
+    } @finally {
+        gLGKeyboardSizingDepth--;
+    }
 
     if (outermost) {
         size = LGKeyboardReserveSize(size);
@@ -679,13 +720,16 @@ static void LGUpdateKeyboardVisualEffect(UIView *effectView) {
           NSClassFromString(@"UIKBBackdropView") != Nil,
           NSClassFromString(@"UIKBVisualEffectView") != Nil);
     lgObservePreferenceReload(^{
-        LGKeyboardRefreshReportedGeometry(UIScreen.mainScreen);
-        for (UIView *stock in gLGKeyboardBackdrops.allObjects) {
-            LGUpdateKeyboardGlass(stock);
-        }
-        for (UIView *effectView in gLGKeyboardVisualEffects.allObjects) {
-            LGUpdateKeyboardVisualEffect(effectView);
-        }
-        LGKeyboardScheduleKeyplaneRefresh();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!lgHostEnabled(@"Keyboard")) gLGKeyboardPredictionStateKnown = NO;
+            LGKeyboardRefreshReportedGeometry(UIScreen.mainScreen);
+            for (UIView *stock in gLGKeyboardBackdrops.allObjects) {
+                LGUpdateKeyboardGlass(stock);
+            }
+            for (UIView *effectView in gLGKeyboardVisualEffects.allObjects) {
+                LGUpdateKeyboardVisualEffect(effectView);
+            }
+            LGKeyboardScheduleKeyplaneRefresh();
+        });
     });
 }

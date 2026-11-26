@@ -508,10 +508,14 @@ NSArray<NSDictionary *> *LGRendererItemsForHostPrefix(NSString *prefix) {
         LGSliderSetting(key(@"DispersionStrength"),
                         LGLocalized(@"prefs.control.dispersion_strength"),
                         LGLocalized(@"prefs.subtitle.dispersion_strength"),
-                        host->dispersionStrength, 1.0, dispersionMax, 1),
-        LGGlassSpecularSetting(key(@"SpecularOpacity"), host->specularOpacity, 0.0, 1.0, 2),
-        LGGlassBlurSetting(key(@"Blur"), host->blur, 0.0, 50.0, 1),
+                        host->dispersionStrength, 0.0, dispersionMax, 1),
     ]];
+    if (![prefix isEqualToString:@"CoverSheet"] &&
+        ![prefix isEqualToString:@"Keyboard"] &&
+        ![prefix isEqualToString:@"Clock"]) {
+        [items addObject:LGGlassSpecularSetting(key(@"SpecularOpacity"), host->specularOpacity, 0.0, 1.0, 2)];
+    }
+    [items addObject:LGGlassBlurSetting(key(@"Blur"), host->blur, 0.0, 50.0, 1)];
     if (![prefix isEqualToString:@"AssistiveTouch"]) {
         [items addObject:@{
             @"type": @"color", @"key": key(@"LightTintColor"),
@@ -528,8 +532,7 @@ NSArray<NSDictionary *> *LGRendererItemsForHostPrefix(NSString *prefix) {
         [items insertObject:LGSliderSetting(key(@"CornerRadius"),
                                             LGLocalized(@"prefs.control.corner_radius"),
                                             LGLocalized(@"prefs.subtitle.corner_radius"),
-                                            LGReadPreference(@"CoverSheet.CornerRadius",
-                                                             @(kLGCoverSheetCornerRadiusPoints)).doubleValue,
+                                            kLGCoverSheetCornerRadiusPoints,
                                             0.0, 200.0, 1)
                       atIndex:2];
     }
@@ -931,6 +934,13 @@ NSArray<NSDictionary *> *LGAllSurfaceItems(void) {
     [all addObjectsFromArray:LGHomescreenItems()];
     [all addObjectsFromArray:LGLockscreenItems()];
     [all addObjectsFromArray:LGAppLibraryItems()];
+    [all addObjectsFromArray:LGRendererItemsForHostPrefix(@"CoverSheet")];
+    [all addObjectsFromArray:LGKeyboardItems()];
+    [all addObjectsFromArray:LGTabBarItems()];
+    [all addObjectsFromArray:LGRendererItemsForHostPrefix(@"AssistiveTouch")];
+    [all addObjectsFromArray:LGRendererItemsForHostPrefix(@"VolumeHUD")];
+    [all addObjectsFromArray:LGRendererItemsForHostPrefix(@"PillHUD")];
+    [all addObjectsFromArray:LGGlobalControlsItems()];
     return [all copy];
 }
 

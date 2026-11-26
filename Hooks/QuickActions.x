@@ -8,7 +8,7 @@ static void *kQAGlassKey = &kQAGlassKey;
 static void *kQABackdropKey = &kQABackdropKey;
 static void *kQABackdropAlphaKey = &kQABackdropAlphaKey;
 static NSHashTable<UIVisualEffectView *> *sQuickActionHosts;
-static void removeQuickActionsGlass(UIVisualEffectView *fx);
+static void removeQuickActionsGlass(UIVisualEffectView *fx, BOOL removeTracking);
 
 static UIView *qaBackdropView(UIView *effectView) {
     for (UIView *sub in effectView.subviews) {
@@ -36,10 +36,12 @@ static void qaSetBackdropHidden(UIVisualEffectView *effectView) {
 
 static BOOL isQuickActionsHost(UIView *view) {
     if (![view isKindOfClass:[UIVisualEffectView class]] || !view.window) return NO;
-    if (view.window.safeAreaInsets.bottom <= 0.0) return NO;
-    Class qaCls = NSClassFromString(@"CSQuickActionsButton");
+    static Class qaCls;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ qaCls = NSClassFromString(@"CSQuickActionsButton"); });
+    if (!qaCls) return NO;
     for (UIView *a = view.superview; a; a = a.superview) {
-        if (qaCls && [a isKindOfClass:qaCls]) return YES;
+        if ([a isKindOfClass:qaCls]) return YES;
         if ([a isKindOfClass:[UIVisualEffectView class]]) return NO;
     }
     return NO;
@@ -47,7 +49,7 @@ static BOOL isQuickActionsHost(UIView *view) {
 
 static void injectQuickActionsGlass(UIVisualEffectView *fx) {
     if (!lgHostEnabled(@"QuickActions")) {
-        removeQuickActionsGlass(fx);
+        removeQuickActionsGlass(fx, NO);
         return;
     }
     UIView *container = fx.contentView;
@@ -55,37 +57,39 @@ static void injectQuickActionsGlass(UIVisualEffectView *fx) {
 
     qaSetBackdropHidden(fx);
 
-    if (@available(iOS 13.0, *)) {
-        fx.overrideUserInterfaceStyle        = UIUserInterfaceStyleLight;
-        container.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
-    }
-
     LGLiveBackdropView *glass = objc_getAssociatedObject(fx, kQAGlassKey);
+    BOOL freshInject = NO;
     if (!glass) {
         glass = LGCreateRegisteredGlass(container.bounds, nil, @"QuickActions");
         if (!glass) return;
         glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [container insertSubview:glass atIndex:0];
         objc_setAssociatedObject(fx, kQAGlassKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        freshInject = YES;
     }
     if (glass.superview != container) [container insertSubview:glass atIndex:0];
-    glass.frame               = container.bounds;
-    glass.layer.cornerRadius  = fmin(CGRectGetWidth(container.bounds), CGRectGetHeight(container.bounds)) * 0.5;
+    if (!CGRectEqualToRect(glass.frame, container.bounds)) {
+        glass.frame = container.bounds;
+    }
+    CGFloat radius = fmin(CGRectGetWidth(container.bounds), CGRectGetHeight(container.bounds)) * 0.5;
+    if (fabs(glass.layer.cornerRadius - radius) > 0.25) {
+        glass.layer.cornerRadius = radius;
+    }
     glass.layer.cornerCurve   = kCACornerCurveContinuous;
     glass.layer.masksToBounds = YES;
-    [glass applyFilters];
+    if (freshInject) [glass applyFilters];
     if (!sQuickActionHosts) sQuickActionHosts = [NSHashTable weakObjectsHashTable];
     [sQuickActionHosts addObject:fx];
     lgTrackGlass(glass, @"QuickActions", nil);
 }
 
-static void removeQuickActionsGlass(UIVisualEffectView *fx) {
+static void removeQuickActionsGlass(UIVisualEffectView *fx, BOOL removeTracking) {
     LGLiveBackdropView *glass = objc_getAssociatedObject(fx, kQAGlassKey);
-    if (@available(iOS 13.0, *)) {
-        fx.overrideUserInterfaceStyle             = UIUserInterfaceStyleUnspecified;
-        fx.contentView.overrideUserInterfaceStyle = UIUserInterfaceStyleUnspecified;
-    }
     UIView *backdrop = objc_getAssociatedObject(fx, kQABackdropKey);
+    if (!glass && !backdrop) {
+        if (removeTracking) [sQuickActionHosts removeObject:fx];
+        return;
+    }
     NSNumber *alpha = objc_getAssociatedObject(fx, kQABackdropAlphaKey);
     if (backdrop && alpha) backdrop.alpha = alpha.doubleValue;
     objc_setAssociatedObject(fx, kQABackdropKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -94,13 +98,18 @@ static void removeQuickActionsGlass(UIVisualEffectView *fx) {
         [glass removeFromSuperview];
         objc_setAssociatedObject(fx, kQAGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
-    [sQuickActionHosts removeObject:fx];
+    if (removeTracking) [sQuickActionHosts removeObject:fx];
 }
 
 static void LGReconcileQuickActionHosts(void) {
     for (UIVisualEffectView *host in sQuickActionHosts.allObjects) {
-        if (lgHostEnabled(@"QuickActions")) injectQuickActionsGlass(host);
-        else removeQuickActionsGlass(host);
+        if (!host.window) {
+            removeQuickActionsGlass(host, YES);
+        } else if (lgHostEnabled(@"QuickActions")) {
+            injectQuickActionsGlass(host);
+        } else {
+            removeQuickActionsGlass(host, NO);
+        }
     }
 }
 
@@ -108,7 +117,7 @@ static void LGReconcileQuickActionHosts(void) {
 - (void)didMoveToWindow {
     %orig;
     UIView *self_ = (UIView *)self;
-    if (!self_.window) { removeQuickActionsGlass((UIVisualEffectView *)self_); return; }
+    if (!self_.window) { removeQuickActionsGlass((UIVisualEffectView *)self_, YES); return; }
     if (isQuickActionsHost(self_)) injectQuickActionsGlass((UIVisualEffectView *)self_);
 }
 - (void)layoutSubviews {

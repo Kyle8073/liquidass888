@@ -15,9 +15,32 @@ static const CGFloat kLGPrefsSliderContractedThumbWidth = 36.0;
 static UIImage *LGTransparentThumbImage(CGSize size) {
     if (size.width <= 0 || size.height <= 0) return nil;
     UIGraphicsBeginImageContextWithOptions(size, NO, 0);
+    if (!UIGraphicsGetCurrentContext()) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return image;
+}
+
+static UIImage *LGSharedTransparentThumbImage(CGSize size) {
+    static UIImage *cachedThumb = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cachedThumb = LGTransparentThumbImage(size);
+    });
+    return cachedThumb;
+}
+
+static UIImage *LGSharedTransparentTrackImage(void) {
+    static UIImage *cachedTrack = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cachedTrack = [LGTransparentThumbImage(CGSizeMake(2.0, 2.0))
+            resizableImageWithCapInsets:UIEdgeInsetsZero resizingMode:UIImageResizingModeStretch];
+    });
+    return cachedTrack;
 }
 
 static BOOL LGSliderUsesSegmentedMode(UISlider *slider) {
@@ -175,6 +198,18 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
         : [UIColor colorWithWhite:0.0 alpha:0.20];
 }
 
+@interface LGSliderDisplayLinkProxy : NSObject
+@property (nonatomic, weak) id target;
+@end
+
+@implementation LGSliderDisplayLinkProxy
+- (void)handleThumbDisplayLink:(CADisplayLink *)link {
+    id t = self.target;
+    if (t) [t performSelector:@selector(handleThumbDisplayLink:) withObject:link];
+    else [link invalidate];
+}
+@end
+
 @interface LGPrefsLiquidSlider ()
 @property (nonatomic, strong) LGLiveBackdropView *glassThumbView;
 @property (nonatomic, strong) UIView *trackBackgroundView;
@@ -185,6 +220,9 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
 @property (nonatomic, strong) UIImpactFeedbackGenerator *lightFeedbackGenerator;
 @property (nonatomic, strong) UIImpactFeedbackGenerator *mediumFeedbackGenerator;
 @property (nonatomic, assign) BOOL trackingActive;
+@property (nonatomic, assign) float valueAtTouchBegan;
+@property (nonatomic, assign) float lastNotifiedValue;
+@property (nonatomic, assign) BOOL hasNotifiedValue;
 @property (nonatomic, assign) BOOL hasPresentedThumbCenter;
 @property (nonatomic, assign) CGFloat presentedThumbCenterX;
 @property (nonatomic, assign) CGFloat logicalThumbCenterX;
@@ -237,14 +275,13 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     self.renderedThumbSize = self.contractedThumbSize;
     self.renderedExpansion = 0.0;
     self.targetExpansion = 0.0;
-    UIImage *clearImage = LGTransparentThumbImage(self.contractedThumbSize);
+    UIImage *clearImage = LGSharedTransparentThumbImage(self.contractedThumbSize);
     [self setThumbImage:clearImage forState:UIControlStateNormal];
     [self setThumbImage:clearImage forState:UIControlStateHighlighted];
     [self enforceCustomTrackOnly];
     self.thumbTintColor = UIColor.clearColor;
     self.lightFeedbackGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     self.mediumFeedbackGenerator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [self ensureGlassThumbView];
     [self ensureContractedThumbView];
     [self ensureTrackBackgroundView];
     [self ensureMagneticFillView];
@@ -252,8 +289,7 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
 }
 
 - (void)enforceCustomTrackOnly {
-    UIImage *transparentTrack = [LGTransparentThumbImage(CGSizeMake(2.0, 2.0))
-        resizableImageWithCapInsets:UIEdgeInsetsZero resizingMode:UIImageResizingModeStretch];
+    UIImage *transparentTrack = LGSharedTransparentTrackImage();
     [self setMinimumTrackImage:transparentTrack forState:UIControlStateNormal];
     [self setMinimumTrackImage:transparentTrack forState:UIControlStateHighlighted];
     [self setMaximumTrackImage:transparentTrack forState:UIControlStateNormal];
@@ -288,7 +324,6 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    [self ensureGlassThumbView];
     [self ensureContractedThumbView];
     [self ensureTrackBackgroundView];
     [self ensureMagneticFillView];
@@ -329,6 +364,9 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     BOOL began = [super beginTrackingWithTouch:touch withEvent:event];
     if (!began) return NO;
     self.trackingActive = YES;
+    self.valueAtTouchBegan = self.value;
+    self.lastNotifiedValue = self.value;
+    self.hasNotifiedValue = NO;
     self.hasPresentedThumbCenter = YES;
     self.presentedThumbCenterX = [self resolvedThumbCenterX];
     self.logicalThumbCenterX = self.presentedThumbCenterX;
@@ -374,7 +412,14 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     if (LGSliderUsesSegmentedMode(self)) {
         CGFloat snapCenterX = self.hasPresentedThumbCenter ? self.logicalThumbCenterX : [self resolvedThumbCenterX];
         float snappedValue = LGSliderNearestSegmentValueForCenterX(self, snapCenterX);
-        [super setValue:snappedValue animated:NO];
+        if (fabsf(self.value - snappedValue) > 0.0001f) {
+            [super setValue:snappedValue animated:NO];
+        }
+    }
+    float compareBaseline = self.hasNotifiedValue ? self.lastNotifiedValue : self.valueAtTouchBegan;
+    if (fabsf(self.value - compareBaseline) > 0.0001f) {
+        self.lastNotifiedValue = self.value;
+        self.hasNotifiedValue = YES;
         [self sendActionsForControlEvents:UIControlEventValueChanged];
     }
     self.trackingActive = NO;
@@ -393,7 +438,14 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     if (LGSliderUsesSegmentedMode(self)) {
         CGFloat snapCenterX = self.hasPresentedThumbCenter ? self.logicalThumbCenterX : [self resolvedThumbCenterX];
         float snappedValue = LGSliderNearestSegmentValueForCenterX(self, snapCenterX);
-        [super setValue:snappedValue animated:NO];
+        if (fabsf(self.value - snappedValue) > 0.0001f) {
+            [super setValue:snappedValue animated:NO];
+        }
+    }
+    float compareBaseline = self.hasNotifiedValue ? self.lastNotifiedValue : self.valueAtTouchBegan;
+    if (fabsf(self.value - compareBaseline) > 0.0001f) {
+        self.lastNotifiedValue = self.value;
+        self.hasNotifiedValue = YES;
         [self sendActionsForControlEvents:UIControlEventValueChanged];
     }
     self.trackingActive = NO;
@@ -469,7 +521,11 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
         float newValue = self.minimumValue + (float)normalized * (self.maximumValue - self.minimumValue);
         if (fabs(self.value - newValue) > 0.0001f) {
             [super setValue:newValue animated:NO];
-            [self sendActionsForControlEvents:UIControlEventValueChanged];
+            if (self.continuous) {
+                self.lastNotifiedValue = newValue;
+                self.hasNotifiedValue = YES;
+                [self sendActionsForControlEvents:UIControlEventValueChanged];
+            }
         }
     }
 
@@ -526,15 +582,15 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
                                                                groupName:nil
                                                               filterType:LGFilterTypeForHostPrefix(@"PrefsSlider")];
     glass.userInteractionEnabled = NO;
+    BOOL darkMode = LGSliderIsDarkMode(self.traitCollection);
     glass.layer.shadowColor = UIColor.blackColor.CGColor;
-    glass.layer.shadowOpacity = 0.08;
-    glass.layer.shadowRadius = 4.0;
-    glass.layer.shadowOffset = CGSizeMake(0.0, 1.0);
+    glass.layer.shadowOpacity = darkMode ? 0.12 : 0.08;
+    glass.layer.shadowRadius = darkMode ? 7.0 : 4.0;
+    glass.layer.shadowOffset = darkMode ? CGSizeMake(0.0, 2.0) : CGSizeMake(0.0, 1.0);
     glass.alpha = 0.0;
     glass.hidden = YES;
     self.glassThumbView = glass;
     [self addSubview:glass];
-
 }
 
 - (void)ensureContractedThumbView {
@@ -547,7 +603,8 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     thumb.layer.shadowRadius = 5.0;
     thumb.layer.shadowOffset = CGSizeZero;
     self.contractedThumbView = thumb;
-    [self addSubview:thumb];
+    if (self.glassThumbView) [self insertSubview:thumb belowSubview:self.glassThumbView];
+    else [self addSubview:thumb];
 }
 
 - (void)ensureMagneticFillView {
@@ -557,8 +614,7 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     fill.userInteractionEnabled = NO;
     fill.clipsToBounds = YES;
     self.magneticFillView = fill;
-
-    [self insertSubview:fill belowSubview:self.glassThumbView];
+    [self insertSubview:fill aboveSubview:self.trackBackgroundView];
 }
 
 - (void)ensureTrackBackgroundView {
@@ -566,7 +622,7 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     UIView *track = [[UIView alloc] initWithFrame:CGRectZero];
     track.userInteractionEnabled = NO;
     self.trackBackgroundView = track;
-    [self insertSubview:track belowSubview:self.glassThumbView];
+    [self insertSubview:track atIndex:0];
 }
 
 - (void)updateThumbMaterialColors {
@@ -574,10 +630,12 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     self.contractedThumbView.backgroundColor = LGSliderIdleThumbColor(self.traitCollection);
     self.contractedThumbView.layer.shadowOpacity = 0.12;
     self.contractedThumbView.layer.shadowRadius = 5.0;
-    self.glassThumbView.layer.shadowOpacity = darkMode ? 0.12 : 0.08;
-    self.glassThumbView.layer.shadowRadius = darkMode ? 7.0 : 4.0;
-    self.glassThumbView.layer.shadowOffset = darkMode ? CGSizeMake(0.0, 2.0) : CGSizeMake(0.0, 1.0);
-    self.glassThumbView.layer.shadowColor = UIColor.blackColor.CGColor;
+    if (self.glassThumbView) {
+        self.glassThumbView.layer.shadowOpacity = darkMode ? 0.12 : 0.08;
+        self.glassThumbView.layer.shadowRadius = darkMode ? 7.0 : 4.0;
+        self.glassThumbView.layer.shadowOffset = darkMode ? CGSizeMake(0.0, 2.0) : CGSizeMake(0.0, 1.0);
+        self.glassThumbView.layer.shadowColor = UIColor.blackColor.CGColor;
+    }
     self.magneticFillView.backgroundColor = self.liquidAccentColor ?: LGSliderEffectiveAccentColor(self);
     self.trackBackgroundView.backgroundColor = self.liquidTrackColor ?: LGSliderInactiveTrackColor(self.traitCollection);
 }
@@ -590,7 +648,9 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
 - (void)startThumbDisplayLinkIfNeeded {
     if (self.thumbDisplayLink || !self.window) return;
     self.lastDisplayLinkTimestamp = 0.0;
-    self.thumbDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleThumbDisplayLink:)];
+    LGSliderDisplayLinkProxy *proxy = [[LGSliderDisplayLinkProxy alloc] init];
+    proxy.target = self;
+    self.thumbDisplayLink = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(handleThumbDisplayLink:)];
     [self.thumbDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
@@ -608,6 +668,10 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
 }
 
 - (void)handleThumbDisplayLink:(CADisplayLink *)link {
+    if (!self.window) {
+        [self stopThumbDisplayLink];
+        return;
+    }
     CFTimeInterval dt = self.lastDisplayLinkTimestamp > 0.0 ? (link.timestamp - self.lastDisplayLinkTimestamp) : (1.0 / 60.0);
     self.lastDisplayLinkTimestamp = link.timestamp;
     CGFloat frameFactor = fmin(MAX(dt * 60.0, 0.35), 1.4);
@@ -647,13 +711,12 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     if (expanded || self.hasRenderedThumbState) {
         [self startThumbDisplayLinkIfNeeded];
     }
-    self.glassThumbView.layer.cornerRadius = nextSize.height * 0.5;
+    if (self.glassThumbView) self.glassThumbView.layer.cornerRadius = nextSize.height * 0.5;
     (void)animated;
     [self updateGlassThumbFrameAnimated:NO];
 }
 
 - (void)updateGlassThumbFrameAnimated:(BOOL)animated {
-    [self ensureGlassThumbView];
     [self ensureContractedThumbView];
     [self ensureTrackBackgroundView];
     [self ensureMagneticFillView];
@@ -664,7 +727,6 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     CGRect contractedFrame = CGRectInset(frame,
                                          (frame.size.width - self.contractedThumbSize.width) * 0.5,
                                          (frame.size.height - self.contractedThumbSize.height) * 0.5);
-    self.glassThumbView.layer.cornerRadius = CGRectGetHeight(frame) * 0.5;
     (void)animated;
     CGFloat expansion = fmax(0.0, fmin(self.renderedExpansion, 1.0));
     CGFloat visualExpansion = expansion * expansion * (3.0 - (2.0 * expansion));
@@ -674,21 +736,28 @@ static UIColor *LGSliderInactiveTrackColor(UITraitCollection *traitCollection) {
     CGFloat motionSquash = fmin(0.10, visualExpansion * 0.028 + stretchExcess * 0.0032);
     CGFloat glassScaleX = glassScale - motionSquash * 0.95;
     CGFloat glassScaleY = glassScale + motionSquash * 0.55;
-    self.glassThumbView.bounds = CGRectMake(0.0, 0.0, frame.size.width,
-                                            frame.size.height);
-    self.glassThumbView.center = CGPointMake(CGRectGetMidX(frame),
-                                             CGRectGetMidY(frame));
+
+    BOOL needsGlass = visualExpansion >= 0.01 || self.trackingActive || self.targetExpansion > 0.01 || self.thumbDisplayLink != nil;
+    if (needsGlass && self.window) [self ensureGlassThumbView];
+    if (self.glassThumbView) {
+        self.glassThumbView.layer.cornerRadius = CGRectGetHeight(frame) * 0.5;
+        self.glassThumbView.bounds = CGRectMake(0.0, 0.0, frame.size.width,
+                                                frame.size.height);
+        self.glassThumbView.center = CGPointMake(CGRectGetMidX(frame),
+                                                 CGRectGetMidY(frame));
+        self.glassThumbView.alpha = visualExpansion;
+        self.glassThumbView.transform = CGAffineTransformMakeScale(glassScaleX, glassScaleY);
+        self.glassThumbView.hidden = visualExpansion < 0.01;
+    }
+
     self.contractedThumbView.bounds = CGRectMake(0.0, 0.0,
                                                  contractedFrame.size.width,
                                                  contractedFrame.size.height);
     self.contractedThumbView.center = CGPointMake(CGRectGetMidX(contractedFrame),
                                                   CGRectGetMidY(contractedFrame));
-    self.glassThumbView.alpha = visualExpansion;
     self.contractedThumbView.alpha = 1.0 - visualExpansion;
-    self.glassThumbView.transform = CGAffineTransformMakeScale(glassScaleX, glassScaleY);
     self.contractedThumbView.transform = CGAffineTransformMakeScale(contractedScale, contractedScale);
     self.contractedThumbView.layer.cornerRadius = CGRectGetHeight(contractedFrame) * 0.5;
-    self.glassThumbView.hidden = visualExpansion < 0.01;
     self.contractedThumbView.hidden = visualExpansion > 0.99;
     [self updateMagneticFill];
 }

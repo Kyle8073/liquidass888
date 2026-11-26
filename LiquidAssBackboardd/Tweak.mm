@@ -46,6 +46,10 @@ static void lgClearAccessibilityFiles(void) {
     while ((entry = readdir(directory))) {
         if (strncmp(entry->d_name, "liquidass", 9) != 0 &&
             strncmp(entry->d_name, "liquidglass", 11) != 0) continue;
+        // Preserve safe-mode guard, crash-probe state, logs, and active shared memory;
+        // only remove orphaned atomic write temporary files.
+        size_t nameLen = strlen(entry->d_name);
+        if (nameLen < 4 || strcmp(entry->d_name + nameLen - 4, ".tmp") != 0) continue;
         char path[PATH_MAX] = {};
         snprintf(path, sizeof(path), "%s/%s", directoryPath, entry->d_name);
         unlink(path);
@@ -101,7 +105,8 @@ static bool lgReadGaussianIdentityState(LGGaussianIdentityState *state) {
         && state->magic == kLGGaussianIdentityMagic
         && state->version == kLGGaussianIdentityVersion
         && (state->mode == kLGGaussianIdentityProbe
-            || state->mode == kLGGaussianIdentityDisabled);
+            || state->mode == kLGGaussianIdentityDisabled
+            || state->mode == kLGGaussianHookProbe);
 }
 
 static void lgRemoveGaussianIdentityState(void) {
@@ -380,7 +385,6 @@ static const char *kForceHookPath =
     "/var/mobile/Library/Accessibility/lg_force_hook";
 
 static id<MTLLibrary>              g_shaderLibrary = nil;
-static id<MTLBuffer>               g_uniformsBuf  = nil;
 static std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> *g_renderPipelines = nullptr;
 static id<MTLTexture>              g_clockMaskTexture = nil;
 static NSData                     *g_clockMaskData = nil;
@@ -395,6 +399,7 @@ static size_t                      g_clockSharedMaskMappingSize = 0;
 
 static os_unfair_lock g_pipelineLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock g_clockMaskLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock g_hostParamsLock = OS_UNFAIR_LOCK_INIT;
 static bool           g_pipelineInit = false;
 static NSInteger      g_osMajorVersion = 0;
 
@@ -427,7 +432,7 @@ typedef struct {
 __attribute__((destructor))
 static void liquidGlassShutdown(void) {
     g_shaderLibrary = nil;
-    g_uniformsBuf  = nil;
+    os_unfair_lock_lock(&g_clockMaskLock);
     g_clockMaskTexture = nil;
     g_clockMaskData = nil;
     if (g_clockSharedMaskMapping != MAP_FAILED) {
@@ -435,6 +440,7 @@ static void liquidGlassShutdown(void) {
         g_clockSharedMaskMapping = MAP_FAILED;
         g_clockSharedMaskMappingSize = 0;
     }
+    os_unfair_lock_unlock(&g_clockMaskLock);
 }
 
 static const char *kShaderSrc = R"MSL(
@@ -501,47 +507,6 @@ float quartzGlassHighlight(float distanceFromEdge,
     highlight /= max(1.0 + (1.0 - highlight) * oppositeAttenuation,
                      0.0001);
     return highlight * max(strength, 0.0);
-}
-
-float linearize(float c) {
-    return c > 0.04045 ? pow((c + 0.055) / 1.055, 2.4) : c / 12.92;
-}
-float gammaEncode(float c) {
-    return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-}
-
-float3 srgbToXyz(float3 rgb) {
-    float3 l = float3(linearize(rgb.r), linearize(rgb.g), linearize(rgb.b));
-    return float3(dot(l, float3(0.4124, 0.3576, 0.1805)),
-                  dot(l, float3(0.2126, 0.7152, 0.0722)),
-                  dot(l, float3(0.0193, 0.1192, 0.9505)));
-}
-float3 xyzToSrgb(float3 xyz) {
-    float3 l = float3(dot(xyz, float3( 3.2406,-1.5372,-0.4986)),
-                      dot(xyz, float3(-0.9689, 1.8758, 0.0415)),
-                      dot(xyz, float3( 0.0557,-0.2040, 1.0570)));
-    return clamp(float3(gammaEncode(l.r), gammaEncode(l.g), gammaEncode(l.b)), 0.0, 1.0);
-}
-
-float labF(float t)    { float t3 = t*t*t; return t3>0.008856? pow(t,1.0/3.0) : 7.787*t+16.0/116.0; }
-float labInvF(float t) { float t3 = t*t*t; return t3>0.008856? t3 : (t-16.0/116.0)/7.787; }
-
-float3 xyzToLab(float3 xyz) {
-    float3 n = xyz / float3(0.95047, 1.0, 1.08883);
-    float fx = labF(n.x), fy = labF(n.y), fz = labF(n.z);
-    return float3(116.0*fy - 16.0, 500.0*(fx-fy), 200.0*(fy-fz));
-}
-float3 labToXyz(float3 lab) {
-    float fy = (lab.x+16.0)/116.0, fx = fy+lab.y/500.0, fz = fy-lab.z/200.0;
-    return float3(0.95047*labInvF(fx), labInvF(fy), 1.08883*labInvF(fz));
-}
-float3 srgbToLch(float3 rgb) {
-    float3 lab = xyzToLab(srgbToXyz(rgb));
-    return float3(lab.x, length(lab.yz), atan2(lab.z, lab.y));
-}
-float3 lchToSrgb(float3 lch) {
-    float3 lab = float3(lch.x, cos(lch.z)*lch.y, sin(lch.z)*lch.y);
-    return xyzToSrgb(labToXyz(lab));
 }
 
 float bottomRoundedBoxDistance(float2 point, float2 size, float radius) {
@@ -622,7 +587,7 @@ float4 liquidGlassPixel(texture2d<float, access::sample> src,
         fh = u.resolution.x;
     }
     float  R        = u.radius, bezel = u.bezelWidth;
-    float  eta      = 1.0 / u.refractiveIndex;
+    float  eta      = 1.0 / max(u.refractiveIndex, 1.0);
     float  shortest = min(fw, fh);
 
     float signedDistance;
@@ -632,27 +597,41 @@ float4 liquidGlassPixel(texture2d<float, access::sample> src,
     bool subShape = false;
     float cornerBlend = 0.0;
     if (u.useGlyphMask > 0.5) {
+        if (glyphMask.sample(s, localUV).r < 0.05) {
+            return float4(0.0);
+        }
 
         float bestDistance = bezel + 1.0;
         float2 bestDirection = float2(0.0, -1.0);
-        constexpr int directionCount = 12;
-        for (int directionIndex = 0; directionIndex < directionCount; directionIndex++) {
-            float angle = (6.28318530718 * float(directionIndex)) / float(directionCount);
-            float2 candidateDirection = float2(cos(angle), sin(angle));
+        constexpr float2 kGlyphDirs[8] = {
+            float2( 1.0,        0.0),
+            float2( 0.70710678, 0.70710678),
+            float2( 0.0,        1.0),
+            float2(-0.70710678, 0.70710678),
+            float2(-1.0,        0.0),
+            float2(-0.70710678,-0.70710678),
+            float2( 0.0,       -1.0),
+            float2( 0.70710678,-0.70710678)
+        };
+        float initialProbe = max(1.0, bezel / 32.0);
+        for (int directionIndex = 0; directionIndex < 8; directionIndex++) {
+            float2 candidateDirection = kGlyphDirs[directionIndex];
+            float searchCap = min(bezel, bestDistance);
             float low = 0.0;
-            float high = bezel + 1.0;
-            float probe = 1.0;
-            for (int level = 0; level < 6; level++) {
-                probe = min(probe, bezel);
-                float2 probeUV = localUV + candidateDirection * (probe / u.resolution);
+            float high = searchCap + 1.0;
+            float probe = initialProbe;
+            for (int level = 0; level < 7; level++) {
+                float clampedProbe = min(probe, searchCap);
+                float2 probeUV = localUV + candidateDirection * (clampedProbe / u.resolution);
                 if (glyphMask.sample(s, probeUV).r < 0.15) {
-                    high = probe;
+                    high = clampedProbe;
                     break;
                 }
-                low = probe;
+                low = clampedProbe;
+                if (clampedProbe >= searchCap) break;
                 probe *= 2.0;
             }
-            if (high <= bezel) {
+            if (high <= searchCap) {
                 for (int refinement = 0; refinement < 3; refinement++) {
                     float middle = (low + high) * 0.5;
                     float2 probeUV = localUV + candidateDirection * (middle / u.resolution);
@@ -720,8 +699,9 @@ float4 liquidGlassPixel(texture2d<float, access::sample> src,
             float2 q = abs(p) - core;
             float2 corner = max(q, float2(0.0));
             float2 normalized = corner / max(extent, float2(0.001));
-            float superLength = pow(pow(normalized.x, 4.0) +
-                                    pow(normalized.y, 4.0), 0.25);
+            float2 n2 = normalized * normalized;
+            float2 n4 = n2 * n2;
+            float superLength = sqrt(sqrt(n4.x + n4.y));
             if (q.x <= 0.0 && q.y <= 0.0) {
 
                 signedDistance = -min(halfSize.x - abs(p.x),
@@ -803,8 +783,9 @@ float4 liquidGlassPixel(texture2d<float, access::sample> src,
 
         textureDir = float2(dir.y, -dir.x);
     }
+    float refrFactor = clamp((1.0 - eta) / 0.42, 0.0, 2.5);
     float2 dispPx = -textureDir * normDisp * bezel
-                  * u.refractionScale * edgeOpacity;
+                  * u.refractionScale * refrFactor * edgeOpacity;
 
     float dispersion = clamp(u.dispersionStrength, 0.0, 20.0);
     constexpr float zoomRampSpan = 0.3;
@@ -827,47 +808,30 @@ float4 liquidGlassPixel(texture2d<float, access::sample> src,
     float4 bg = greenSample;
     if (dispersion > 0.001 && dot(dispPx, dispPx) > 0.0001) {
         float2 aberrationPx = -textureDir * normDisp * dispersion * 8.0 * edgeOpacity;
-        float3 accumulated = float3(0.0);
-        float accumulatedAlpha = 0.0;
-
-        for (int i = 0; i < 3; i++) {
-            float weight = 1.0 - float(i) / 3.0;
+        auto sampleDisp = [&](float shift) -> float4 {
             float2 uv = backdropSampleUV(capturePx, px,
-                                          dispPx + aberrationPx * weight,
-                                          isCoverSheet, u, zoomMix);
-            float4 sample = src.sample(s, uv);
-            if (sample.a < 0.01) {
+                                         dispPx + aberrationPx * shift,
+                                         isCoverSheet, u, zoomMix);
+            float4 smp = src.sample(s, uv);
+            if (smp.a < 0.01) {
                 if (!loadedFallback) {
                     fallback = src.sample(s, captureUV);
                     loadedFallback = true;
                 }
-                sample = fallback;
+                smp = fallback;
             }
-            accumulated.r += sample.r * weight;
-            accumulated.g += sample.g * (1.0 - weight);
-            accumulatedAlpha += sample.a;
-        }
+            return smp;
+        };
 
-        for (int i = 0; i < 4; i++) {
-            float weight = float(i) / 3.0;
-            float2 uv = backdropSampleUV(capturePx, px,
-                                          dispPx - aberrationPx * weight,
-                                          isCoverSheet, u, zoomMix);
-            float4 sample = src.sample(s, uv);
-            if (sample.a < 0.01) {
-                if (!loadedFallback) {
-                    fallback = src.sample(s, captureUV);
-                    loadedFallback = true;
-                }
-                sample = fallback;
-            }
-            accumulated.g += sample.g * (1.0 - weight);
-            accumulated.b += sample.b * weight;
-            accumulatedAlpha += sample.a;
-        }
+        float4 sP1  = sampleDisp( 1.0);
+        float4 sP05 = sampleDisp( 0.5);
+        float4 sM05 = sampleDisp(-0.5);
+        float4 sM1  = sampleDisp(-1.0);
 
-        bg.rgb = accumulated * float3(0.5, 1.0 / 3.0, 0.5);
-        bg.a = accumulatedAlpha / 7.0;
+        bg.r = sP1.r * 0.65 + sP05.r * 0.35;
+        bg.g = sP05.g * 0.25 + greenSample.g * 0.50 + sM05.g * 0.25;
+        bg.b = sM05.b * 0.35 + sM1.b * 0.65;
+        bg.a = (sP1.a + sP05.a + greenSample.a + sM05.a + sM1.a) * 0.2;
     }
 
     float3 outRGB = mix(bg.rgb, u.tintColor.rgb, u.tintColor.a);
@@ -968,7 +932,7 @@ renderPipelineForFormat(__unsafe_unretained id<MTLDevice> device, MTLPixelFormat
     return pipeline;
 }
 
-static bool lgEnsureClockSharedMaskMapping(void) {
+static bool lgEnsureClockSharedMaskMappingLocked(void) {
     if (g_clockSharedMaskMapping != MAP_FAILED) return true;
     int fd = open(kClockSharedMaskPath, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -988,8 +952,8 @@ static bool lgEnsureClockSharedMaskMapping(void) {
     return true;
 }
 
-static void lgRefreshClockMaskFromSharedMemory(void) {
-    if (!lgEnsureClockSharedMaskMapping()) return;
+static void lgRefreshClockMaskFromSharedMemoryLocked(void) {
+    if (!lgEnsureClockSharedMaskMappingLocked()) return;
     LGClockSharedMaskHeader *shared =
         (LGClockSharedMaskHeader *)g_clockSharedMaskMapping;
 
@@ -999,6 +963,7 @@ static void lgRefreshClockMaskFromSharedMemory(void) {
 
         LGClockSharedMaskHeader snapshot = {};
         memcpy(&snapshot, shared, sizeof(snapshot));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint64_t pixelCount = (uint64_t)snapshot.width * (uint64_t)snapshot.height;
         size_t available = g_clockSharedMaskMappingSize - sizeof(snapshot);
         if (snapshot.magic != 0x4c474d34 || snapshot.version != 1 ||
@@ -1012,10 +977,7 @@ static void lgRefreshClockMaskFromSharedMemory(void) {
             return;
         }
 
-        os_unfair_lock_lock(&g_clockMaskLock);
-        bool alreadyCurrent = g_clockMaskGeneration == snapshot.generation;
-        os_unfair_lock_unlock(&g_clockMaskLock);
-        if (alreadyCurrent) return;
+        if (g_clockMaskGeneration == snapshot.generation) return;
 
         LGClockMaskHeader legacyHeader = {
             0x4c474333,
@@ -1030,25 +992,26 @@ static void lgRefreshClockMaskFromSharedMemory(void) {
         [data appendBytes:(uint8_t *)g_clockSharedMaskMapping + sizeof(snapshot)
                    length:(NSUInteger)snapshot.pixelBytes];
 
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint64_t secondSequence = __atomic_load_n(&shared->sequence, __ATOMIC_ACQUIRE);
         if (firstSequence != secondSequence || (secondSequence & 1)) continue;
 
-        os_unfair_lock_lock(&g_clockMaskLock);
         g_clockMaskData = data;
         g_clockMaskWidth = snapshot.width;
         g_clockMaskHeight = snapshot.height;
         g_clockMaskImageScale = snapshot.imageScale;
         g_clockMaskBezelWidthPoints = snapshot.bezelWidthPoints;
         g_clockMaskGeneration = snapshot.generation;
-        os_unfair_lock_unlock(&g_clockMaskLock);
         return;
     }
 }
 
 static id<MTLTexture>
-lgClockMaskTexture(__unsafe_unretained id<MTLDevice> device) {
-    lgRefreshClockMaskFromSharedMemory();
+lgClockMaskTexture(__unsafe_unretained id<MTLDevice> device,
+                   float *outImageScale,
+                   float *outBezelWidthPoints) {
     os_unfair_lock_lock(&g_clockMaskLock);
+    lgRefreshClockMaskFromSharedMemoryLocked();
     if (!g_clockMaskData || !g_clockMaskWidth || !g_clockMaskHeight) {
         os_unfair_lock_unlock(&g_clockMaskLock);
         return nil;
@@ -1076,6 +1039,8 @@ lgClockMaskTexture(__unsafe_unretained id<MTLDevice> device) {
         }
     }
     id<MTLTexture> texture = g_clockMaskTexture;
+    if (outImageScale) *outImageScale = g_clockMaskImageScale;
+    if (outBezelWidthPoints) *outBezelWidthPoints = g_clockMaskBezelWidthPoints;
     os_unfair_lock_unlock(&g_clockMaskLock);
     return texture;
 }
@@ -1084,52 +1049,6 @@ lgClockMaskTexture(__unsafe_unretained id<MTLDevice> device) {
 
 static const float kCornerRadiusRatio = 28.0f / 220.0f;
 static const float kMaxBezelPx        = 34.0f;
-
-static void ensureUniforms(__unsafe_unretained id<MTLDevice> device, uint64_t w, uint64_t h) {
-    if (g_uniformsBuf) return; // buffer itself only needs allocating once
-
-    g_uniformsBuf = [device newBufferWithLength:sizeof(LGUniforms)
-                                        options:MTLResourceStorageModeShared];
-    if (!g_uniformsBuf) return;
-
-    LGUniforms *u = (LGUniforms *)g_uniformsBuf.contents;
-
-    // unused placeholder kept for uniform layout
-    u->screenResolution = simd_make_float2(750.f, 1334.f);
-    u->cardOrigin               = simd_make_float2(0.f, 0.f);
-    u->glassThickness          = 18.f;
-    u->refractionScale         = 2.6f;
-    u->refractiveIndex         = 1.85f;
-    u->wallpaperOrigin         = simd_make_float2(0.f, 0.f);
-    u->samplingTransformX      = simd_make_float2(1.f, 0.f);
-    u->samplingTransformY      = simd_make_float2(0.f, 1.f);
-    u->samplingTransformOffset = simd_make_float2(0.f, 0.f);
-    u->samplingOrientation     = 1.f;
-    u->backdropZoom            = 1.f;
-    u->shapeScale              = 1.f;
-    u->shapeOrigin             = simd_make_float2(0.f, 0.f);
-    u->shapeSize               = simd_make_float2(0.f, 0.f);
-    u->useGlyphMask            = 0.f;
-    u->dispersionStrength      = 5.0f;
-    u->fresnelGlareStrength    = 0.5f;
-    u->borderWidthPixels       = 2.0f;
-    lglog("uniforms buffer allocated (geometry refreshed per-frame)");
-}
-
-static void updateUniformsForFrame(uint64_t w, uint64_t h) {
-    if (!g_uniformsBuf) return;
-    LGUniforms *u = (LGUniforms *)g_uniformsBuf.contents;
-
-    float fw = (float)w, fh = (float)h;
-    float shortest = fminf(fw, fh);
-
-    u->resolution          = simd_make_float2(fw, fh);
-    u->outputResolution    = simd_make_float2(fw, fh);
-    u->wallpaperResolution = simd_make_float2(fw, fh);
-    u->lensOrigin          = simd_make_float2(0.f, 0.f);
-    u->radius              = kCornerRadiusRatio * shortest;
-    u->bezelWidth           = kMaxBezelPx;
-}
 
 typedef struct {
     const char *typeName;
@@ -1170,27 +1089,56 @@ static bool lgUsesDynamicRadiusRoute(int host) {
     return strcmp(kHostDefaults[host].prefPrefix, "Clock") != 0;
 }
 
-static const LGHostParams *lgHostParamsForAtom(uint32_t atom, bool *dark) {
+static LGHostParams lgCopyHostParamsForAtom(uint32_t atom,
+                                            bool *dark,
+                                            float *outFresnelGlare,
+                                            float *outCoverSheetCornerRadius,
+                                            bool *outRoutedRadius,
+                                            int *outRouteHost,
+                                            float *outRadiusRatio) {
     if (dark) *dark = false;
+    if (outRoutedRadius) *outRoutedRadius = false;
+    if (outRouteHost) *outRouteHost = -1;
+
+    int hostIndex = 0;
+    bool isDark = false;
+    bool hasRouteRadius = false;
+    float routeRadiusRatio = 0.0f;
+
     auto route = g_radiusRoutes.find(atom);
     if (route != g_radiusRoutes.end()) {
-        static thread_local LGHostParams routed;
-        routed = g_hostParams[route->second.host];
-        routed.radiusRatio = route->second.radiusRatio;
-        if (dark) *dark = route->second.dark;
-        return &routed;
-    }
-    auto refreshRoute = g_refreshRoutes.find(atom);
-    if (refreshRoute != g_refreshRoutes.end()) {
-        if (dark) *dark = refreshRoute->second.dark;
-        return &g_hostParams[refreshRoute->second.host];
-    }
-    if (atom) for (int i = 1; i < kHostCount; i++)
-        if (g_hostParams[i].atom == atom || g_darkAtoms[i] == atom) {
-            if (dark) *dark = g_darkAtoms[i] == atom;
-            return &g_hostParams[i];
+        hostIndex = route->second.host;
+        isDark = route->second.dark;
+        hasRouteRadius = true;
+        routeRadiusRatio = route->second.radiusRatio;
+        if (outRoutedRadius) *outRoutedRadius = true;
+        if (outRouteHost) *outRouteHost = hostIndex;
+    } else {
+        auto refreshRoute = g_refreshRoutes.find(atom);
+        if (refreshRoute != g_refreshRoutes.end()) {
+            hostIndex = refreshRoute->second.host;
+            isDark = refreshRoute->second.dark;
+        } else if (atom) {
+            for (int i = 1; i < kHostCount; i++) {
+                if (g_hostParams[i].atom == atom || g_darkAtoms[i] == atom) {
+                    hostIndex = i;
+                    isDark = (g_darkAtoms[i] == atom);
+                    break;
+                }
+            }
         }
-    return &g_hostParams[0];
+    }
+
+    os_unfair_lock_lock(&g_hostParamsLock);
+    LGHostParams copy = g_hostParams[hostIndex];
+    if (outFresnelGlare) *outFresnelGlare = g_fresnelGlareStrength;
+    if (outCoverSheetCornerRadius) *outCoverSheetCornerRadius = g_coverSheetCornerRadiusPoints;
+    os_unfair_lock_unlock(&g_hostParamsLock);
+
+    if (hasRouteRadius) copy.radiusRatio = routeRadiusRatio;
+    if (dark) *dark = isDark;
+    if (outRadiusRatio) *outRadiusRatio = copy.radiusRatio;
+    return copy;
 }
 
 static NSString *lgPrefsPath(void) {
@@ -1235,30 +1183,31 @@ static bool lgDecodeTintColor(NSString *hex, simd_float4 *out) {
 static void lgReloadHostPrefs(void) {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:lgPrefsPath()];
     NSNumber *debugLogging = prefs[@"Debug.Logging.Enabled"];
-    gLGBackboardDebugLogging = [debugLogging isKindOfClass:NSNumber.class]
+    bool newDebugLogging = [debugLogging isKindOfClass:NSNumber.class]
         ? debugLogging.boolValue : false;
     NSNumber *fresnelStrength = prefs[@"Renderer.FresnelGlareStrength"];
-    g_fresnelGlareStrength = [fresnelStrength isKindOfClass:NSNumber.class]
+    float newFresnelGlare = [fresnelStrength isKindOfClass:NSNumber.class]
         ? fminf(1.0f, fmaxf(0.0f, fresnelStrength.floatValue)) : 0.5f;
-    g_coverSheetCornerRadiusPoints = 64.0f;
+    float newCoverSheetRadius = 64.0f;
     NSNumber *coverSheetCornerRadius = prefs[@"CoverSheet.CornerRadius"];
     if ([coverSheetCornerRadius isKindOfClass:[NSNumber class]]) {
-        g_coverSheetCornerRadiusPoints = fmaxf(0.0f, coverSheetCornerRadius.floatValue);
+        newCoverSheetRadius = fmaxf(0.0f, coverSheetCornerRadius.floatValue);
     }
+
     int overrides = 0;
+    LGHostParams updatedHosts[kHostCount];
     for (int i = 0; i < kHostCount; i++) {
-        uint32_t keepAtom = g_hostParamsInit ? g_hostParams[i].atom : 0;
-        uint32_t keepDarkAtom = g_hostParamsInit ? g_darkAtoms[i] : 0;
-        g_hostParams[i] = kHostDefaults[i];
-        g_hostParams[i].atom = keepAtom;
-        g_darkAtoms[i] = keepDarkAtom;
-        if (i > 0) { lgApplyHistoricalTintDefault(i, &g_hostParams[i], false); lgApplyHistoricalTintDefault(i, &g_hostParams[i], true); }
+        updatedHosts[i] = kHostDefaults[i];
+        if (i > 0) {
+            lgApplyHistoricalTintDefault(i, &updatedHosts[i], false);
+            lgApplyHistoricalTintDefault(i, &updatedHosts[i], true);
+        }
         if (!prefs) continue;
         NSString *p = [NSString stringWithUTF8String:kHostDefaults[i].prefPrefix];
         NSNumber *v;
         #define LG_OVR(field, key) \
             if ((v = prefs[[p stringByAppendingString:@"." key]]) && \
-                [v isKindOfClass:[NSNumber class]]) { g_hostParams[i].field = v.floatValue; overrides++; }
+                [v isKindOfClass:[NSNumber class]]) { updatedHosts[i].field = v.floatValue; overrides++; }
 
         LG_OVR(bezelWidthPoints,  @"BezelWidth");
         LG_OVR(glassThickness,     @"GlassThickness");
@@ -1272,27 +1221,44 @@ static void lgReloadHostPrefs(void) {
         #undef LG_OVR
         NSNumber *dispersionEnabled = prefs[[p stringByAppendingString:@".DispersionEnabled"]];
         if ([dispersionEnabled isKindOfClass:[NSNumber class]]) {
-            if (!dispersionEnabled.boolValue) g_hostParams[i].dispersionStrength = 0.0f;
+            if (!dispersionEnabled.boolValue) {
+                updatedHosts[i].dispersionStrength = 0.0f;
+            } else if (updatedHosts[i].dispersionStrength <= 0.0f) {
+                updatedHosts[i].dispersionStrength = 1.0f;
+            }
             overrides++;
         }
         NSString *tintHex = prefs[[p stringByAppendingString:@".LightTintColor"]];
         simd_float4 tint;
         if (lgDecodeTintColor(tintHex, &tint)) {
-            g_hostParams[i].tintR = tint.x; g_hostParams[i].tintG = tint.y;
-            g_hostParams[i].tintB = tint.z; g_hostParams[i].tintStrength = tint.w;
+            updatedHosts[i].tintR = tint.x; updatedHosts[i].tintG = tint.y;
+            updatedHosts[i].tintB = tint.z; updatedHosts[i].tintStrength = tint.w;
             overrides++;
         }
         if (lgDecodeTintColor(prefs[[p stringByAppendingString:@".DarkTintColor"]], &tint)) {
-            g_hostParams[i].darkTintR = tint.x; g_hostParams[i].darkTintG = tint.y;
-            g_hostParams[i].darkTintB = tint.z; g_hostParams[i].darkTintStrength = tint.w;
+            updatedHosts[i].darkTintR = tint.x; updatedHosts[i].darkTintG = tint.y;
+            updatedHosts[i].darkTintB = tint.z; updatedHosts[i].darkTintStrength = tint.w;
             overrides++;
         }
     }
+
+    os_unfair_lock_lock(&g_hostParamsLock);
+    gLGBackboardDebugLogging = newDebugLogging;
+    g_fresnelGlareStrength = newFresnelGlare;
+    g_coverSheetCornerRadiusPoints = newCoverSheetRadius;
+    for (int i = 0; i < kHostCount; i++) {
+        uint32_t keepAtom = g_hostParamsInit ? g_hostParams[i].atom : 0;
+        updatedHosts[i].atom = keepAtom;
+        g_hostParams[i] = updatedHosts[i];
+    }
     g_hostParamsInit = true;
+    float bannerBezel = g_hostParams[4].bezelWidthPoints;
+    float bannerRefr = g_hostParams[4].refractionScale;
+    os_unfair_lock_unlock(&g_hostParamsLock);
 
     lglog("lgReloadHostPrefs: %s (%d hosts, %d overrides) banner.bezel=%.3f refr=%.2f",
           prefs ? "loaded prefs" : "defaults", kHostCount, overrides,
-          g_hostParams[4].bezelWidthPoints, g_hostParams[4].refractionScale);
+          bannerBezel, bannerRefr);
 }
 
 static void lgPrefsReloadCallback(CFNotificationCenterRef c, void *o, CFStringRef n,
@@ -1317,12 +1283,13 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
                                bool flag, void *cm, void *shape, float *out)
 {
     static uint64_t tsum_stop = 0, tsum_ours = 0, tsum_gauss = 0, tcount = 0;
-    uint64_t t_start = mach_absolute_time();
+    bool logTiming = gLGBackboardDebugLogging;
+    uint64_t t_start = logTiming ? mach_absolute_time() : 0;
 
     // trace only the first calls so render logs stay usable
     static uint64_t g_traceCalls = 0;
-    uint64_t callN = ++g_traceCalls;
-#define R13TRACE(...) do { if (callN <= 3) lglog(__VA_ARGS__); } while (0)
+    uint64_t callN = logTiming ? __sync_add_and_fetch(&g_traceCalls, 1) : 0;
+#define R13TRACE(...) do { if (logTiming && callN <= 3) lglog(__VA_ARGS__); } while (0)
     R13TRACE("R13[%llu] ENTER ctx=%p surface=%p opacity=%.2f scale=%.2f flag=%d",
              callN, ctx, surface, opacity, scale, (int)flag);
 
@@ -1357,53 +1324,70 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     ensurePipeline(device);
     if (!g_shaderLibrary) { lglog("ourCustomRender13: no shader library"); return; }
 
-    ensureUniforms(device, w, h);
-    if (!g_uniformsBuf) { lglog("ourCustomRender13: no uniforms buf"); return; }
-    updateUniformsForFrame(w, h);
+    float fw = (float)w, fh = (float)h;
+    float shortestF = fminf(fw, fh);
+    LGUniforms lu = {};
+    lu.resolution              = simd_make_float2(fw, fh);
+    lu.outputResolution        = simd_make_float2(fw, fh);
+    lu.screenResolution        = simd_make_float2(750.f, 1334.f);
+    lu.cardOrigin              = simd_make_float2(0.f, 0.f);
+    lu.wallpaperResolution     = simd_make_float2(fw, fh);
+    lu.lensOrigin              = simd_make_float2(0.f, 0.f);
+    lu.wallpaperOrigin         = simd_make_float2(0.f, 0.f);
+    lu.samplingTransformX      = simd_make_float2(1.f, 0.f);
+    lu.samplingTransformY      = simd_make_float2(0.f, 1.f);
+    lu.samplingTransformOffset = simd_make_float2(0.f, 0.f);
+    lu.samplingOrientation     = 1.f;
+    lu.backdropZoom            = 1.f;
+    lu.shapeScale              = 1.f;
+    lu.shapeOrigin             = simd_make_float2(0.f, 0.f);
+    lu.shapeSize               = simd_make_float2(0.f, 0.f);
+    lu.useGlyphMask            = 0.f;
     R13TRACE("R13[%llu] pipeline+uniforms ready", callN);
 
-    LGUniforms lu = *(LGUniforms *)g_uniformsBuf.contents;
     uint32_t ftype = filter
         ? *(uint32_t *)((uint8_t *)filter + g_filterAtomOffset) : 0;
     bool darkTint = false;
-    const LGHostParams *hp = lgHostParamsForAtom(ftype, &darkTint);
-    float shortestF = fminf((float)w, (float)h);
-
-    auto radiusIt = g_radiusRoutes.find(ftype);
-    float radiusRatio = radiusIt != g_radiusRoutes.end()
-        ? radiusIt->second.radiusRatio : hp->radiusRatio;
+    bool routedRadius = false;
+    int routeHost = -1;
+    float radiusRatio = kCornerRadiusRatio;
+    float fresnelGlareStrength = 0.5f;
+    float coverSheetCornerRadiusPoints = 64.0f;
+    LGHostParams hp = lgCopyHostParamsForAtom(ftype, &darkTint,
+                                                &fresnelGlareStrength,
+                                                &coverSheetCornerRadiusPoints,
+                                                &routedRadius, &routeHost,
+                                                &radiusRatio);
     lu.radius          = radiusRatio * shortestF;
     float pixelsPerPoint = fmaxf(0.1f, scale * 2.0f);
     lu.borderWidthPixels = pixelsPerPoint;
-    lu.bezelWidth      = fminf(hp->bezelWidthPoints * pixelsPerPoint,
+    lu.bezelWidth      = fminf(hp.bezelWidthPoints * pixelsPerPoint,
                                shortestF * 0.5f);
-    lu.glassThickness     = hp->glassThickness;
-    lu.refractionScale    = hp->refractionScale;
-    lu.refractiveIndex    = hp->refractiveIndex;
-    lu.dispersionStrength = hp->dispersionStrength;
-    lu.fresnelGlareStrength = !strcmp(hp->prefPrefix, "Clock")
-        ? g_fresnelGlareStrength : 0.0f;
-    lu.tintColor          = darkTint ? simd_make_float4(hp->darkTintR, hp->darkTintG, hp->darkTintB, hp->darkTintStrength)
-                                  : simd_make_float4(hp->tintR, hp->tintG, hp->tintB, hp->tintStrength);
+    lu.glassThickness     = hp.glassThickness;
+    lu.refractionScale    = hp.refractionScale;
+    lu.refractiveIndex    = hp.refractiveIndex;
+    lu.dispersionStrength = hp.dispersionStrength;
+    lu.fresnelGlareStrength = !strcmp(hp.prefPrefix, "Clock")
+        ? fresnelGlareStrength : 0.0f;
+    lu.tintColor          = darkTint ? simd_make_float4(hp.darkTintR, hp.darkTintG, hp.darkTintB, hp.darkTintStrength)
+                                  : simd_make_float4(hp.tintR, hp.tintG, hp.tintB, hp.tintStrength);
 
-    if (!strcmp(hp->prefPrefix, "Keyboard")) {
+    if (logTiming && !strcmp(hp.prefPrefix, "Keyboard")) {
         static int keyboardGeometryLogs = 0;
         int logIndex = __sync_fetch_and_add(&keyboardGeometryLogs, 1);
         if (logIndex < 80) {
-            bool routedRadius = radiusIt != g_radiusRoutes.end();
             lglog("keyboard-geometry[%d] atom=0x%x tex=%llux%llu dark=%d "
                   "route=%d routeHost=%d hostRatio=%.6f selectedRatio=%.6f "
                   "radius=%.3f bezelWidth=%.3fpt bezel=%.3f",
                   logIndex, ftype, w, h, darkTint, routedRadius,
-                  routedRadius ? radiusIt->second.host : -1,
-                  hp->radiusRatio, radiusRatio, lu.radius,
-                  hp->bezelWidthPoints, lu.bezelWidth);
+                  routeHost, hp.radiusRatio, radiusRatio, lu.radius,
+                  hp.bezelWidthPoints, lu.bezelWidth);
         }
     }
 
-    lu.backdropZoom    = !strcmp(hp->prefPrefix, "PrefsSwitch") ? 0.75f : 1.0f;
+    lu.backdropZoom    = !strcmp(hp.prefPrefix, "PrefsSwitch") ? 0.75f : 1.0f;
     lu.shapeScale      = 1.0f;
-    if (!strcmp(hp->prefPrefix, "TabBarSelection")) {
+    if (!strcmp(hp.prefPrefix, "TabBarSelection")) {
         LGLensRectSlot lens = {};
         if (LGLensRectRead(LGLensRectSlotTabBarSelection, &lens)) {
             lu.backdropZoom = 0.80f;
@@ -1414,12 +1398,12 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
                                                lens.heightRatio * (float)h);
             float shapeShortest = fminf(lu.shapeSize.x, lu.shapeSize.y);
             lu.radius = radiusRatio * shapeShortest;
-            lu.bezelWidth = fminf(hp->bezelWidthPoints * pixelsPerPoint,
+            lu.bezelWidth = fminf(hp.bezelWidthPoints * pixelsPerPoint,
                                   shapeShortest * 0.5f);
         }
     }
 
-    if (!strcmp(hp->prefPrefix, "PrefsSegment")) {
+    if (!strcmp(hp.prefPrefix, "PrefsSegment")) {
         lu.backdropZoom = 0.70f;
         LGLensRectSlot lens = {};
         if (LGLensRectRead(LGLensRectSlotPrefsSegment, &lens)) {
@@ -1430,36 +1414,37 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
                                               lens.heightRatio * (float)h);
             float shapeShortest = fminf(lu.shapeSize.x, lu.shapeSize.y);
             lu.radius = radiusRatio * shapeShortest;
-            lu.bezelWidth = fminf(hp->bezelWidthPoints * pixelsPerPoint,
+            lu.bezelWidth = fminf(hp.bezelWidthPoints * pixelsPerPoint,
                                   shapeShortest * 0.5f);
         } else {
             lu.shapeScale = 0.75f;
             float shapeShortest = shortestF * lu.shapeScale;
             lu.radius = radiusRatio * shapeShortest;
-            lu.bezelWidth = fminf(hp->bezelWidthPoints * pixelsPerPoint,
+            lu.bezelWidth = fminf(hp.bezelWidthPoints * pixelsPerPoint,
                                   shapeShortest * 0.5f);
         }
 
     }
 
     id<MTLTexture> clockMask = nil;
-    if (!strcmp(hp->prefPrefix, "Clock")) {
-        clockMask = lgClockMaskTexture(device);
+    if (!strcmp(hp.prefPrefix, "Clock")) {
+        float clockMaskScale = 1.0f;
+        float clockMaskBezelPoints = 24.0f;
+        clockMask = lgClockMaskTexture(device, &clockMaskScale, &clockMaskBezelPoints);
         lu.useGlyphMask = clockMask ? 1.f : 0.f;
         if (clockMask) {
-            float maskPointWidth = (float)clockMask.width / g_clockMaskImageScale;
-            float maskPointHeight = (float)clockMask.height / g_clockMaskImageScale;
+            float maskPointWidth = (float)clockMask.width / clockMaskScale;
+            float maskPointHeight = (float)clockMask.height / clockMaskScale;
             float pixelsPerPointX = maskPointWidth > 0.0f ? (float)w / maskPointWidth : 1.0f;
             float pixelsPerPointY = maskPointHeight > 0.0f ? (float)h / maskPointHeight : 1.0f;
-            float pixelsPerPoint = fminf(pixelsPerPointX, pixelsPerPointY);
-            lu.bezelWidth = fmaxf(1.0f, g_clockMaskBezelWidthPoints * pixelsPerPoint);
+            float clockPixelsPerPoint = fminf(pixelsPerPointX, pixelsPerPointY);
+            lu.bezelWidth = fmaxf(1.0f, clockMaskBezelPoints * clockPixelsPerPoint);
         }
-    } else if (!strcmp(hp->prefPrefix, "Keyboard")) {
+    } else if (!strcmp(hp.prefPrefix, "Keyboard")) {
         lu.useGlyphMask = 0.25f;
-    } else if (!strcmp(hp->prefPrefix, "CoverSheet")) {
+    } else if (!strcmp(hp.prefPrefix, "CoverSheet")) {
 
         lu.useGlyphMask = -1.f;
-        float coverSheetCornerRadiusPoints = g_coverSheetCornerRadiusPoints;
         lu.radius = coverSheetCornerRadiusPoints * 2.0f;
         LGCoverSheetSharedState state = {};
         bool coverStateValid = LGCoverSheetReadSharedState(&state) && state.active;
@@ -1483,39 +1468,43 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
                     state.originXRatio * (float)w,
                     state.originYRatio * (float)h);
             }
-            float pixelsPerPoint = state.pixelsPerPoint;
-            if (pixelsPerPoint >= 1.0f && pixelsPerPoint <= 4.0f) {
-                lu.radius = coverSheetCornerRadiusPoints * pixelsPerPoint;
+            float coverPixelsPerPoint = state.pixelsPerPoint;
+            if (coverPixelsPerPoint >= 1.0f && coverPixelsPerPoint <= 4.0f) {
+                lu.radius = coverSheetCornerRadiusPoints * coverPixelsPerPoint;
             }
         }
         if (coverStateValid && state.pixelsPerPoint >= 1.0f &&
             state.pixelsPerPoint <= 4.0f) {
-            lu.bezelWidth = fminf(hp->bezelWidthPoints * state.pixelsPerPoint,
+            lu.bezelWidth = fminf(hp.bezelWidthPoints * state.pixelsPerPoint,
                                   shortestF * 0.5f);
-            static int sCoverBezelLogs = 0;
-            if (__sync_fetch_and_add(&sCoverBezelLogs, 1) < 12) {
-                lglog("coversheet-bezel width=%.2fpt ppp=%.2f px=%.2f",
-                      hp->bezelWidthPoints, state.pixelsPerPoint, lu.bezelWidth);
+            if (logTiming) {
+                static int sCoverBezelLogs = 0;
+                if (__sync_fetch_and_add(&sCoverBezelLogs, 1) < 12) {
+                    lglog("coversheet-bezel width=%.2fpt ppp=%.2f px=%.2f",
+                          hp.bezelWidthPoints, state.pixelsPerPoint, lu.bezelWidth);
+                }
             }
         }
-        static uint32_t sLastCoverOrientation = UINT32_MAX;
-        static int sInitialCoverStateLogs = 0;
-        uint32_t previousOrientation = __sync_lock_test_and_set(
-            &sLastCoverOrientation,
-            coverStateValid ? state.deviceOrientation : UINT32_MAX);
-        int stateLogIndex = __sync_fetch_and_add(&sInitialCoverStateLogs, 1);
-        if (previousOrientation != sLastCoverOrientation || stateLogIndex < 12) {
-            lglog("coversheet-state-read valid=%d active=%u orientation=%u "
-                  "ratio={%.4f,%.4f} ppp=%.2f tex=%llux%llu "
-                  "aux=%.1f lens={%.2f,%.2f} radius=%.2f",
-                  coverStateValid, state.active, state.deviceOrientation,
-                  state.originXRatio, state.originYRatio, state.pixelsPerPoint,
-                  w, h, lu.useGlyphMask, lu.lensOrigin.x, lu.lensOrigin.y,
-                  lu.radius);
+        if (logTiming) {
+            static uint32_t sLastCoverOrientation = UINT32_MAX;
+            static int sInitialCoverStateLogs = 0;
+            uint32_t previousOrientation = __sync_lock_test_and_set(
+                &sLastCoverOrientation,
+                coverStateValid ? state.deviceOrientation : UINT32_MAX);
+            int stateLogIndex = __sync_fetch_and_add(&sInitialCoverStateLogs, 1);
+            if (previousOrientation != sLastCoverOrientation || stateLogIndex < 12) {
+                lglog("coversheet-state-read valid=%d active=%u orientation=%u "
+                      "ratio={%.4f,%.4f} ppp=%.2f tex=%llux%llu "
+                      "aux=%.1f lens={%.2f,%.2f} radius=%.2f",
+                      coverStateValid, state.active, state.deviceOrientation,
+                      state.originXRatio, state.originYRatio, state.pixelsPerPoint,
+                      w, h, lu.useGlyphMask, lu.lensOrigin.x, lu.lensOrigin.y,
+                      lu.radius);
+            }
         }
     }
 
-    if (g_radiusRoutes.find(ftype) != g_radiusRoutes.end()) {
+    if (logTiming && routedRadius) {
         static int sPrefsGeometryLogs = 0;
         if (__sync_fetch_and_add(&sPrefsGeometryLogs, 1) < 20) {
             lglog("prefs render atom=0x%x tex=%llux%llu ratio=%.4f radius=%.2f bezel=%.2f",
@@ -1531,7 +1520,7 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
         g_origGaussR13(self, filter, layer, ctx, opacity, surface,
                        0.0f, flag, cm, shape, out);
     }
-    uint64_t t_afterGauss = mach_absolute_time();
+    uint64_t t_afterGauss = logTiming ? mach_absolute_time() : 0;
     R13TRACE("R13[%llu] after g_origGaussR13", callN);
 
     rawCmdBuf = *(void **)(metalCtx + g_cmdBufOffset);
@@ -1557,26 +1546,30 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     if (!cmdBuf || !destTex || destTex.device != device ||
         !compatibleDimensions ||
         !(destTex.usage & MTLTextureUsageRenderTarget)) {
-        static int sBadDestinationLogs = 0;
-        if (__sync_fetch_and_add(&sBadDestinationLogs, 1) < 20) {
-            lglog("ourCustomRender13: unusable CA destination atom=0x%x surf=%p tex=%p src=%llux%llu dst=%lux%lu usage=%lu; kept stock pass",
-                  ftype, destSurf, rawDestTex, w, h,
-                  (unsigned long)destTex.width, (unsigned long)destTex.height,
-                  (unsigned long)destTex.usage);
+        if (logTiming) {
+            static int sBadDestinationLogs = 0;
+            if (__sync_fetch_and_add(&sBadDestinationLogs, 1) < 20) {
+                lglog("ourCustomRender13: unusable CA destination atom=0x%x surf=%p tex=%p src=%llux%llu dst=%lux%lu usage=%lu; kept stock pass",
+                      ftype, destSurf, rawDestTex, w, h,
+                      (unsigned long)destTex.width, (unsigned long)destTex.height,
+                      (unsigned long)destTex.usage);
+            }
         }
         return;
     }
     lu.outputResolution =
         simd_make_float2((float)destTex.width, (float)destTex.height);
 
-    os_unfair_lock_lock(&g_loggedRenderAtomsLock);
-    bool firstSuccessfulAtom = g_loggedRenderAtoms.insert(ftype).second;
-    os_unfair_lock_unlock(&g_loggedRenderAtomsLock);
-    if (firstSuccessfulAtom) {
-        lglog("render destination ready atom=0x%x host=%s src=%llux%llu dst=%lux%lu radius=%.2f bezel=%.2f aux=%.1f",
-              ftype, hp->prefPrefix, w, h,
-              (unsigned long)destTex.width, (unsigned long)destTex.height, lu.radius,
-              lu.bezelWidth, lu.useGlyphMask);
+    if (logTiming) {
+        os_unfair_lock_lock(&g_loggedRenderAtomsLock);
+        bool firstSuccessfulAtom = g_loggedRenderAtoms.insert(ftype).second;
+        os_unfair_lock_unlock(&g_loggedRenderAtomsLock);
+        if (firstSuccessfulAtom) {
+            lglog("render destination ready atom=0x%x host=%s src=%llux%llu dst=%lux%lu radius=%.2f bezel=%.2f aux=%.1f",
+                  ftype, hp.prefPrefix, w, h,
+                  (unsigned long)destTex.width, (unsigned long)destTex.height, lu.radius,
+                  lu.bezelWidth, lu.useGlyphMask);
+        }
     }
     R13TRACE("R13[%llu] CA destination surf=%p tex=%p dims=%lux%lu",
              callN, destSurf, rawDestTex,
@@ -1585,7 +1578,7 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     if (!g_stopEncoders) { lglog("ourCustomRender13: null stopEncoders"); return; }
     R13TRACE("R13[%llu] before stopEncoders(%p)", callN, (void *)g_stopEncoders);
     g_stopEncoders(ctx);
-    uint64_t t_afterStop = mach_absolute_time();
+    uint64_t t_afterStop = logTiming ? mach_absolute_time() : 0;
     R13TRACE("R13[%llu] after stopEncoders, before encoder", callN);
 
     rawCmdBuf = *(void **)(metalCtx + g_cmdBufOffset);
@@ -1617,27 +1610,32 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
 
-    uint64_t t_afterOurs = mach_absolute_time();
-    R13TRACE("R13[%llu] after our compute dispatch", callN);
+    if (logTiming) {
+        uint64_t t_afterOurs = mach_absolute_time();
+        R13TRACE("R13[%llu] after our compute dispatch", callN);
+        R13TRACE("R13[%llu] DONE", callN);
 
-    R13TRACE("R13[%llu] DONE", callN);
-
-    tsum_stop  += (t_afterStop  - t_afterGauss);
-    tsum_ours  += (t_afterOurs  - t_afterStop);
-    tsum_gauss += (t_afterGauss - t_start);
-    tcount++;
-    if (tcount >= 6000) {
-        static mach_timebase_info_data_t tb = {0, 0};
-        if (tb.denom == 0) mach_timebase_info(&tb);
-        double scaleUs = (double)tb.numer / tb.denom / 1000.0;
-        double avgStop  = (double)tsum_stop  / tcount * scaleUs;
-        double avgOurs  = (double)tsum_ours  / tcount * scaleUs;
-        double avgGauss = (double)tsum_gauss / tcount * scaleUs;
-        double avgTotal = avgStop + avgOurs + avgGauss;
-        lglog("timing (avg over %llu calls): stopEncoders=%.0fus  ourRender=%.0fus  gaussCall=%.0fus  total=%.0fus (%.2fms)",
-              tcount, avgStop, avgOurs, avgGauss, avgTotal, avgTotal / 1000.0);
-        tsum_stop = tsum_ours = tsum_gauss = 0;
-        tcount = 0;
+        __sync_fetch_and_add(&tsum_stop, (t_afterStop - t_afterGauss));
+        __sync_fetch_and_add(&tsum_ours, (t_afterOurs - t_afterStop));
+        __sync_fetch_and_add(&tsum_gauss, (t_afterGauss - t_start));
+        uint64_t curCount = __sync_add_and_fetch(&tcount, 1);
+        if (curCount >= 6000) {
+            uint64_t sStop = __sync_lock_test_and_set(&tsum_stop, 0);
+            uint64_t sOurs = __sync_lock_test_and_set(&tsum_ours, 0);
+            uint64_t sGauss = __sync_lock_test_and_set(&tsum_gauss, 0);
+            uint64_t sCount = __sync_lock_test_and_set(&tcount, 0);
+            if (sCount > 0) {
+                static mach_timebase_info_data_t tb = {0, 0};
+                if (tb.denom == 0) mach_timebase_info(&tb);
+                double scaleUs = (double)tb.numer / tb.denom / 1000.0;
+                double avgStop  = (double)sStop  / sCount * scaleUs;
+                double avgOurs  = (double)sOurs  / sCount * scaleUs;
+                double avgGauss = (double)sGauss / sCount * scaleUs;
+                double avgTotal = avgStop + avgOurs + avgGauss;
+                lglog("timing (avg over %llu calls): stopEncoders=%.0fus  ourRender=%.0fus  gaussCall=%.0fus  total=%.0fus (%.2fms)",
+                      sCount, avgStop, avgOurs, avgGauss, avgTotal, avgTotal / 1000.0);
+            }
+        }
     }
 #undef R13TRACE
 }
@@ -2112,8 +2110,8 @@ static bool registerCustomFilter(void) {
 __attribute__((constructor))
 static void tweakInit(void) {
     @autoreleasepool {
-    lgClearAccessibilityFiles();
     if (lgShouldEnterSafeMode()) return;
+    lgClearAccessibilityFiles();
     {
         NSDictionary *bootPrefs =
             [NSDictionary dictionaryWithContentsOfFile:lgPrefsPath()];

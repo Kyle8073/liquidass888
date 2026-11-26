@@ -89,6 +89,8 @@ jobs:
             SCHEME_FLAG="THEOS_PACKAGE_SCHEME=rootless"
           elif [ "${{ matrix.scheme }}" = "roothide" ]; then
             SCHEME_FLAG="THEOS_PACKAGE_SCHEME=roothide"
+          elif [ "${{ matrix.scheme }}" = "rootful" ]; then
+            SCHEME_FLAG="THEOS_PACKAGE_SCHEME="
           fi
           make clean
           make package \

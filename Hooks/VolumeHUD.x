@@ -52,7 +52,11 @@
 - (void)applyVibranceFilters {
     @try {
         CALayer *layer = self.layer;
-        if (![layer isKindOfClass:NSClassFromString(@"CABackdropLayer")]) return;
+        Class backdropCls = NSClassFromString(@"CABackdropLayer");
+        if (!backdropCls || ![layer isKindOfClass:backdropCls]) return;
+
+        [layer setValue:@(0.5) forKey:@"scale"];
+        if (layer.filters.count > 0) return;
 
         Class filterCls = NSClassFromString(@"CAFilter");
         if (!filterCls) return;
@@ -83,6 +87,53 @@ static const void * const kLGVolumeHUDGlassKey = &kLGVolumeHUDGlassKey;
 static const void * const kLGVolumeHUDVibranceKey = &kLGVolumeHUDVibranceKey;
 static const void * const kLGVolumeHUDMaterialHiddenKey = &kLGVolumeHUDMaterialHiddenKey;
 static const void * const kLGVolumeHUDProbePendingKey = &kLGVolumeHUDProbePendingKey;
+static const void * const kLGVolumeHUDSavedHiddenKey = &kLGVolumeHUDSavedHiddenKey;
+static const void * const kLGVolumeHUDSavedRadiusKey = &kLGVolumeHUDSavedRadiusKey;
+static const void * const kLGVolumeHUDSavedCurveKey = &kLGVolumeHUDSavedCurveKey;
+static const void * const kLGVolumeHUDSavedMasksKey = &kLGVolumeHUDSavedMasksKey;
+static NSHashTable<SBElasticSliderMaterialWrapperView *> *sLGVolumeHUDWrappers;
+
+static void LGVolumeHUDSaveAndHide(UIView *view) {
+    if (!view) return;
+    if (!objc_getAssociatedObject(view, kLGVolumeHUDSavedHiddenKey)) {
+        objc_setAssociatedObject(view, kLGVolumeHUDSavedHiddenKey, @(view.hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    view.hidden = YES;
+}
+
+static void LGVolumeHUDRestoreHidden(UIView *view) {
+    if (!view) return;
+    NSNumber *saved = objc_getAssociatedObject(view, kLGVolumeHUDSavedHiddenKey);
+    if (saved) {
+        view.hidden = saved.boolValue;
+        objc_setAssociatedObject(view, kLGVolumeHUDSavedHiddenKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
+static void LGVolumeHUDSaveLayer(UIView *view) {
+    if (!view || objc_getAssociatedObject(view, kLGVolumeHUDSavedRadiusKey)) return;
+    objc_setAssociatedObject(view, kLGVolumeHUDSavedRadiusKey, @(view.layer.cornerRadius), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (@available(iOS 13.0, *)) {
+        objc_setAssociatedObject(view, kLGVolumeHUDSavedCurveKey, view.layer.cornerCurve ?: kCACornerCurveCircular, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    objc_setAssociatedObject(view, kLGVolumeHUDSavedMasksKey, @(view.layer.masksToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void LGVolumeHUDRestoreLayer(UIView *view) {
+    if (!view) return;
+    NSNumber *radius = objc_getAssociatedObject(view, kLGVolumeHUDSavedRadiusKey);
+    if (!radius) return;
+    view.layer.cornerRadius = radius.doubleValue;
+    if (@available(iOS 13.0, *)) {
+        CALayerCornerCurve curve = objc_getAssociatedObject(view, kLGVolumeHUDSavedCurveKey);
+        if (curve) view.layer.cornerCurve = curve;
+    }
+    NSNumber *masks = objc_getAssociatedObject(view, kLGVolumeHUDSavedMasksKey);
+    if (masks) view.layer.masksToBounds = masks.boolValue;
+    objc_setAssociatedObject(view, kLGVolumeHUDSavedRadiusKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, kLGVolumeHUDSavedCurveKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, kLGVolumeHUDSavedMasksKey, nil, OBJC_ASSOCIATION_ASSIGN);
+}
 
 static BOOL LGVolumeHUDEnabled(void) {
     return lgHostEnabled(@"VolumeHUD");
@@ -142,6 +193,8 @@ static void LGScheduleVolumeHUDProbe(UIView *wrapper) {
 
 static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
     if (!self) return;
+    if (!sLGVolumeHUDWrappers) sLGVolumeHUDWrappers = [NSHashTable weakObjectsHashTable];
+    [sLGVolumeHUDWrappers addObject:self];
 
     MTMaterialView *base = nil;
     MTMaterialView *cap = nil;
@@ -160,19 +213,37 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
 
     if (!LGVolumeHUDEnabled()) {
         LGLiveBackdropView *existing = objc_getAssociatedObject(self, kLGVolumeHUDGlassKey);
-        if (existing) existing.hidden = YES;
+        if (existing) {
+            [existing removeFromSuperview];
+            objc_setAssociatedObject(self, kLGVolumeHUDGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        }
         LGVolumeHUDVibranceView *existingVib = objc_getAssociatedObject(self, kLGVolumeHUDVibranceKey);
-        if (existingVib) existingVib.hidden = YES;
-        if (base) base.hidden = NO;
-        if (cap) cap.hidden = NO;
-        if (shadow) shadow.hidden = NO;
+        if (existingVib) {
+            [existingVib removeFromSuperview];
+            objc_setAssociatedObject(self, kLGVolumeHUDVibranceKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        }
+        LGVolumeHUDRestoreHidden(base);
+        LGVolumeHUDRestoreHidden(cap);
+        LGVolumeHUDRestoreHidden(shadow);
+        LGVolumeHUDRestoreLayer(self);
+        LGVolumeHUDRestoreLayer(sliderWrapper);
+        LGVolumeHUDRestoreLayer(sliderView);
+        if (sliderView && LGVolumeHUDNeedsLegacyMaterialWorkaround()) {
+            for (UIView *subview in sliderView.subviews) {
+                if ([subview isKindOfClass:NSClassFromString(@"MTMaterialView")]) {
+                    LGVolumeHUDRestoreLayer(subview);
+                }
+            }
+        }
         LGSetVolumeHUDBackgroundMaterialsHidden(self, NO);
         return;
     }
 
-    if (base) base.hidden = YES;
-    if (cap) cap.hidden = YES;
-    if (shadow) shadow.hidden = YES;
+    if (!self.window || CGRectIsEmpty(self.bounds)) return;
+
+    LGVolumeHUDSaveAndHide(base);
+    LGVolumeHUDSaveAndHide(cap);
+    LGVolumeHUDSaveAndHide(shadow);
     LGSetVolumeHUDBackgroundMaterialsHidden(self, YES);
 
     LGVolumeHUDVibranceView *vibrance = objc_getAssociatedObject(self, kLGVolumeHUDVibranceKey);
@@ -180,51 +251,62 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
         vibrance = [[LGVolumeHUDVibranceView alloc] initWithFrame:self.bounds];
         if (vibrance) {
             objc_setAssociatedObject(self, kLGVolumeHUDVibranceKey, vibrance, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            if (sliderWrapper) {
+        }
+    }
+    if (vibrance) {
+        if (sliderWrapper) {
+            if (vibrance.superview != self ||
+                ([self.subviews indexOfObjectIdenticalTo:vibrance] > [self.subviews indexOfObjectIdenticalTo:sliderWrapper])) {
                 [self insertSubview:vibrance belowSubview:sliderWrapper];
-            } else {
-                [self addSubview:vibrance];
             }
+        } else if (vibrance.superview != self) {
+            [self addSubview:vibrance];
         }
     }
 
     LGLiveBackdropView *glass = objc_getAssociatedObject(self, kLGVolumeHUDGlassKey);
+    BOOL freshInject = NO;
     if (!glass) {
         glass = LGCreateRegisteredGlass(self.bounds, nil, @"VolumeHUD");
         if (!glass) return;
         objc_setAssociatedObject(self, kLGVolumeHUDGlassKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        lgTrackGlass(glass, @"VolumeHUD", self);
-
+        lgTrackGlass(glass, @"VolumeHUD", nil);
+        [self insertSubview:glass atIndex:0];
+        freshInject = YES;
+    } else if (glass.superview != self || self.subviews.firstObject != glass) {
         [self insertSubview:glass atIndex:0];
     }
 
     CGFloat radius = MIN(self.bounds.size.width, self.bounds.size.height) * 0.5f;
 
     glass.hidden = NO;
-    glass.frame = self.bounds;
+    if (!CGRectEqualToRect(glass.frame, self.bounds)) glass.frame = self.bounds;
     glass.layer.cornerRadius = radius;
     if (@available(iOS 13.0, *)) {
         glass.layer.cornerCurve = kCACornerCurveContinuous;
     }
     glass.layer.masksToBounds = YES;
-    [glass applyFilters];
+    if (freshInject) [glass applyFilters];
 
     if (vibrance) {
         vibrance.hidden = NO;
-        vibrance.frame = self.bounds;
+        if (!CGRectEqualToRect(vibrance.frame, self.bounds)) vibrance.frame = self.bounds;
         vibrance.layer.cornerRadius = radius;
         if (@available(iOS 13.0, *)) {
             vibrance.layer.cornerCurve = kCACornerCurveContinuous;
         }
         vibrance.layer.masksToBounds = YES;
+        [vibrance applyVibranceFilters];
     }
 
+    LGVolumeHUDSaveLayer(self);
     self.layer.cornerRadius = radius;
     if (@available(iOS 13.0, *)) {
         self.layer.cornerCurve = kCACornerCurveContinuous;
     }
 
     if (sliderWrapper) {
+        LGVolumeHUDSaveLayer(sliderWrapper);
         sliderWrapper.layer.cornerRadius = radius;
         if (@available(iOS 13.0, *)) {
             sliderWrapper.layer.cornerCurve = kCACornerCurveContinuous;
@@ -233,6 +315,7 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
     }
 
     if (sliderView) {
+        LGVolumeHUDSaveLayer(sliderView);
         sliderView.layer.cornerRadius = radius;
         if (@available(iOS 13.0, *)) {
             sliderView.layer.cornerCurve = kCACornerCurveContinuous;
@@ -241,6 +324,7 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
         if (LGVolumeHUDNeedsLegacyMaterialWorkaround()) {
             for (UIView *subview in sliderView.subviews) {
                 if (![subview isKindOfClass:NSClassFromString(@"MTMaterialView")]) continue;
+                LGVolumeHUDSaveLayer(subview);
                 subview.layer.cornerRadius = radius;
                 subview.layer.cornerCurve = kCACornerCurveContinuous;
                 subview.layer.masksToBounds = YES;
@@ -268,6 +352,11 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
         LGUpdateVolumeHUDGlass(self);
     }
     return self;
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    LGUpdateVolumeHUDGlass(self);
 }
 
 - (void)layoutSubviews {
@@ -306,7 +395,9 @@ static void LGUpdateVolumeHUDGlass(SBElasticSliderMaterialWrapperView *self) {
     if (!LGIsSpringBoardProcess()) return;
     %init(LGVolumeHUDHooks);
     lgObservePreferenceReload(^{
-
         LGLog(@"VolumeHUD: Preferences reloaded");
+        for (SBElasticSliderMaterialWrapperView *wrapper in sLGVolumeHUDWrappers.allObjects) {
+            LGUpdateVolumeHUDGlass(wrapper);
+        }
     });
 }

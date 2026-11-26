@@ -31,7 +31,9 @@ static void LGNotificationProfileSample(CFTimeInterval elapsed) {
 
 static BOOL LGHasMaterialAncestorBefore(UIView *material, NSString *stopClassName) {
     Class stopCls = NSClassFromString(stopClassName);
-    Class materialClass = NSClassFromString(@"MTMaterialView");
+    static Class materialClass;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ materialClass = NSClassFromString(@"MTMaterialView"); });
     for (UIView *v = material.superview; v; v = v.superview) {
         if (stopCls && [v isKindOfClass:stopCls]) return NO;
         if (materialClass && [v isKindOfClass:materialClass]) return YES;
@@ -46,11 +48,18 @@ static BOOL LGIsPlatterMaterial(UIView *material) {
 }
 
 static UIView *LGPlatterActionButtonAncestor(UIView *material) {
-    Class materialClass = NSClassFromString(@"MTMaterialView");
+    static Class materialClass;
+    static Class platterActionClass;
+    static Class notifActionClass;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        materialClass = NSClassFromString(@"MTMaterialView");
+        platterActionClass = NSClassFromString(@"PLPlatterActionButton");
+        notifActionClass = NSClassFromString(@"NCNotificationListCellActionButton");
+    });
     for (UIView *v = material.superview; v; v = v.superview) {
-        NSString *name = NSStringFromClass(v.class);
-        if ([name isEqualToString:@"PLPlatterActionButton"] ||
-            [name isEqualToString:@"NCNotificationListCellActionButton"])
+        if ((platterActionClass && [v isKindOfClass:platterActionClass]) ||
+            (notifActionClass && [v isKindOfClass:notifActionClass]))
             return v;
         if (materialClass && [v isKindOfClass:materialClass]) return nil;
     }
@@ -62,47 +71,73 @@ static BOOL LGIsPlatterActionMaterial(UIView *material) {
     return LGPlatterActionButtonAncestor(material) != nil;
 }
 
-static BOOL LGResponderChainContainsClass(UIResponder *responder, NSString *name) {
-    Class cls = NSClassFromString(name);
+static BOOL LGResponderChainContainsClass(UIResponder *responder, Class cls) {
+    if (!cls) return NO;
     for (UIResponder *r = responder; r; r = r.nextResponder)
-        if (cls && [r isKindOfClass:cls]) return YES;
+        if ([r isKindOfClass:cls]) return YES;
     return NO;
 }
 
 static void *kLGPlatterClassificationKey = &kLGPlatterClassificationKey;
+static void *kLGLabelOriginalColorKey = &kLGLabelOriginalColorKey;
+static void *kLGLabelApplyingColorKey = &kLGLabelApplyingColorKey;
+static NSHashTable<UILabel *> *sLGBannerLabels;
+static NSHashTable *sLGBannerNotificationControllers;
 
 static BOOL LGIsTopBannerPresentation(UIView *view) {
     if (!view.window) return NO;
-    if ([NSStringFromClass(view.window.class) isEqualToString:@"SBBannerWindow"]) return YES;
-    if (hasAncestorOfClassName(view, @"BNContentViewControllerView")) return YES;
-    if (LGResponderChainContainsClass(view, @"BNContentViewController")) return YES;
-    return LGResponderChainContainsClass(view, @"SBNotificationPresentableViewController");
+    static Class bannerWindowCls;
+    static Class bnContentViewCls;
+    static Class bnControllerCls;
+    static Class sbPresentableCls;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bannerWindowCls = NSClassFromString(@"SBBannerWindow");
+        bnContentViewCls = NSClassFromString(@"BNContentViewControllerView");
+        bnControllerCls = NSClassFromString(@"BNContentViewController");
+        sbPresentableCls = NSClassFromString(@"SBNotificationPresentableViewController");
+    });
+    if (bannerWindowCls && [view.window isKindOfClass:bannerWindowCls]) return YES;
+    if (bnContentViewCls && hasAncestorOfClassName(view, @"BNContentViewControllerView")) return YES;
+    if (LGResponderChainContainsClass(view, bnControllerCls)) return YES;
+    return LGResponderChainContainsClass(view, sbPresentableCls);
 }
 
 static UIView *LGNotificationAncestor(UIView *view) {
+    if (hasAncestorOfClassName(view, @"SBSwitcherAppSuggestionBannerView")) return nil;
+    static Class shortLookCls;
+    static Class longLookCls;
+    static Class platterCls;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        shortLookCls = NSClassFromString(@"NCNotificationShortLookView");
+        longLookCls = NSClassFromString(@"NCNotificationLongLookView");
+        platterCls = NSClassFromString(@"PLPlatterView");
+    });
     for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
-        NSString *name = NSStringFromClass(ancestor.class);
-        if ([name isEqualToString:@"NCNotificationShortLookView"] ||
-            [name isEqualToString:@"NCNotificationLongLookView"] ||
-            [name isEqualToString:@"PLPlatterView"]) return ancestor;
+        if ((shortLookCls && [ancestor isKindOfClass:shortLookCls]) ||
+            (longLookCls && [ancestor isKindOfClass:longLookCls]) ||
+            (platterCls && [ancestor isKindOfClass:platterCls])) return ancestor;
     }
     return nil;
 }
 
 static UIColor *LGForcedPlatterTextColor(UIView *view) {
-    if (!view) return nil;
+    if (!view || !view.window) return nil;
+    BOOL bannerOn = lgHostEnabled(@"Banner");
+    BOOL notifOn = lgHostEnabled(@"Notification");
+    if (!bannerOn && !notifOn) return nil;
     if (LGIsTopBannerPresentation(view))
-        return lgHostEnabled(@"Banner") &&
+        return bannerOn &&
                view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleLight
             ? UIColor.blackColor : nil;
-    if (!lgHostEnabled(@"Notification") || !LGNotificationAncestor(view)) return nil;
+    if (!notifOn || !LGNotificationAncestor(view)) return nil;
     return [LGGlassPreferenceValue(@"Notification.LabelColor") isEqual:@"black"]
         ? UIColor.blackColor : UIColor.whiteColor;
 }
 
 static NSAttributedString *LGAttributedTextWithColor(NSAttributedString *text, UIColor *color) {
-    if (!color) return text;
-    if (!text.length) return text;
+    if (!color || !text.length) return text;
     NSMutableAttributedString *copy = [text mutableCopy];
     [copy addAttribute:NSForegroundColorAttributeName
                  value:color
@@ -110,10 +145,40 @@ static NSAttributedString *LGAttributedTextWithColor(NSAttributedString *text, U
     return copy;
 }
 
+static void LGRefreshLabelPlatterColor(UILabel *label) {
+    if (!label) return;
+    UIColor *forced = LGForcedPlatterTextColor(label);
+    UIColor *saved = objc_getAssociatedObject(label, kLGLabelOriginalColorKey);
+    if (!forced && !saved) return;
+    if (forced && !saved && label.textColor) {
+        objc_setAssociatedObject(label, kLGLabelOriginalColorKey, label.textColor,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UIColor *target = forced ?: saved;
+    if (!target) return;
+    objc_setAssociatedObject(label, kLGLabelApplyingColorKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (label.attributedText.length) {
+        label.attributedText = LGAttributedTextWithColor(label.attributedText, target);
+    }
+    label.textColor = target;
+    objc_setAssociatedObject(label, kLGLabelApplyingColorKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    if (!forced) {
+        objc_setAssociatedObject(label, kLGLabelOriginalColorKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    } else {
+        if (!sLGBannerLabels) sLGBannerLabels = [NSHashTable weakObjectsHashTable];
+        [sLGBannerLabels addObject:label];
+    }
+}
+
 static void LGDisableLockscreenStackDimming(id controller) {
+    if (!controller) return;
+    if (!sLGBannerNotificationControllers) {
+        sLGBannerNotificationControllers = [NSHashTable weakObjectsHashTable];
+    }
+    [sLGBannerNotificationControllers addObject:controller];
     // stack dimming belongs to notifications and not top banners
-    if (!controller || LGIsTopBannerPresentation([controller isKindOfClass:[UIViewController class]]
-                                                   ? ((UIViewController *)controller).view : nil)) return;
+    if (LGIsTopBannerPresentation([controller isKindOfClass:[UIViewController class]]
+                                  ? ((UIViewController *)controller).viewIfLoaded : nil)) return;
     @try {
         id preview = [controller valueForKey:@"viewForPreview"];
         UIView *dimming = [preview valueForKey:@"stackDimmingOverlayView"];
@@ -154,8 +219,8 @@ static void LGUpdatePlatterGlass(UIView *material) {
         LGInstallRegisteredGlassInMaterial(material, kGlassKey, prefix,
                                            UIEdgeInsetsZero, -1.0, nil);
     } else if (LGIsPlatterActionMaterial(material)) {
-
-        LGInstallRegisteredGlassInMaterial(material, kGlassKey, @"Notification",
+        NSString *actionPrefix = LGIsTopBannerPresentation(material) ? @"Banner" : @"Notification";
+        LGInstallRegisteredGlassInMaterial(material, kGlassKey, actionPrefix,
                                            UIEdgeInsetsZero,
                                            LGActionButtonRadius(material), nil);
     }
@@ -176,27 +241,44 @@ static void LGUpdatePlatterGlass(UIView *material) {
 
 %hook UILabel
 - (void)setTextColor:(UIColor *)color {
-    UIColor *forced = LGForcedPlatterTextColor((UIView *)self);
-    if (forced) color = forced;
+    if (![objc_getAssociatedObject(self, kLGLabelApplyingColorKey) boolValue]) {
+        UIColor *forced = LGForcedPlatterTextColor((UIView *)self);
+        if (forced) {
+            if (color) {
+                objc_setAssociatedObject(self, kLGLabelOriginalColorKey, color,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            if (!sLGBannerLabels) sLGBannerLabels = [NSHashTable weakObjectsHashTable];
+            [sLGBannerLabels addObject:(UILabel *)self];
+            color = forced;
+        } else if (color) {
+            objc_setAssociatedObject(self, kLGLabelOriginalColorKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        }
+    }
     %orig(color);
 }
 - (void)setAttributedText:(NSAttributedString *)text {
-    text = LGAttributedTextWithColor(text, LGForcedPlatterTextColor((UIView *)self));
+    if (![objc_getAssociatedObject(self, kLGLabelApplyingColorKey) boolValue]) {
+        UIColor *forced = LGForcedPlatterTextColor((UIView *)self);
+        if (forced) {
+            if (!objc_getAssociatedObject(self, kLGLabelOriginalColorKey) && self.textColor) {
+                objc_setAssociatedObject(self, kLGLabelOriginalColorKey, self.textColor,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            if (!sLGBannerLabels) sLGBannerLabels = [NSHashTable weakObjectsHashTable];
+            [sLGBannerLabels addObject:(UILabel *)self];
+            text = LGAttributedTextWithColor(text, forced);
+        }
+    }
     %orig(text);
 }
 - (void)didMoveToWindow {
     %orig;
-    UIColor *forced = LGForcedPlatterTextColor((UIView *)self);
-    if (!forced) return;
-    if (self.attributedText.length) self.attributedText = LGAttributedTextWithColor(self.attributedText, forced);
-    self.textColor = forced;
+    LGRefreshLabelPlatterColor((UILabel *)self);
 }
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
     %orig(previousTraitCollection);
-    UIColor *forced = LGForcedPlatterTextColor((UIView *)self);
-    if (!forced) return;
-    if (self.attributedText.length) self.attributedText = LGAttributedTextWithColor(self.attributedText, forced);
-    self.textColor = forced;
+    LGRefreshLabelPlatterColor((UILabel *)self);
 }
 %end
 
@@ -214,3 +296,14 @@ static void LGUpdatePlatterGlass(UIView *material) {
     LGDisableLockscreenStackDimming(self);
 }
 %end
+
+%ctor {
+    lgObservePreferenceReload(^{
+        for (UILabel *label in sLGBannerLabels.allObjects) {
+            LGRefreshLabelPlatterColor(label);
+        }
+        for (id controller in sLGBannerNotificationControllers.allObjects) {
+            LGDisableLockscreenStackDimming(controller);
+        }
+    });
+}

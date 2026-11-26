@@ -31,6 +31,33 @@ static NSURL *LGTemporaryPreferencesExportURL(void) {
     return [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:filename]];
 }
 
+static void *kLGObserverCleanupKey = &kLGObserverCleanupKey;
+
+@interface LGHelperDisplayLinkProxy : NSObject
+@property (nonatomic, weak) id target;
+@end
+
+@implementation LGHelperDisplayLinkProxy
+- (void)tick:(CADisplayLink *)link {
+    id t = self.target;
+    if (t) [t performSelector:@selector(tick:) withObject:link];
+    else [link invalidate];
+}
+@end
+
+@interface LGHelperDeallocCleanup : NSObject
+@property (nonatomic, copy) void (^cleanupBlock)(void);
+@end
+
+@implementation LGHelperDeallocCleanup
+- (void)dealloc {
+    if (_cleanupBlock) {
+        _cleanupBlock();
+        _cleanupBlock = nil;
+    }
+}
+@end
+
 @interface LGSliderResetAnimator : NSObject
 @property (nonatomic, weak) UISlider *slider;
 @property (nonatomic, weak) UILabel *valueLabel;
@@ -42,6 +69,10 @@ static NSURL *LGTemporaryPreferencesExportURL(void) {
 @end
 
 @implementation LGSliderResetAnimator
+
+- (void)dealloc {
+    [_displayLink invalidate];
+}
 
 - (void)tick:(CADisplayLink *)link {
     if (!self.slider) {
@@ -60,7 +91,7 @@ static NSURL *LGTemporaryPreferencesExportURL(void) {
     if (t >= 1.0) {
         [self.displayLink invalidate];
         self.displayLink = nil;
-        objc_setAssociatedObject(self.slider, kLGSliderAnimatorKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(self.slider, kLGSliderAnimatorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
@@ -248,7 +279,7 @@ void LGInstallBottomRespringBar(UIViewController *controller, UIView *__strong *
 }
 
 void LGRefreshRespringBarGlass(UIView *respringBar) {
-    if (!respringBar) return;
+    if (!respringBar || !respringBar.window || respringBar.hidden) return;
     UIView *glassView = objc_getAssociatedObject(respringBar, kLGRespringBarGlassViewKey);
     UIView *tintView = objc_getAssociatedObject(respringBar, kLGRespringBarTintViewKey);
     tintView.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull trait) {
@@ -259,24 +290,17 @@ void LGRefreshRespringBarGlass(UIView *respringBar) {
     }];
     glassView.hidden = NO;
     if ([glassView isKindOfClass:[LGLiveBackdropView class]]) {
-        [(LGLiveBackdropView *)glassView applyFilters];
+        LGLiveBackdropView *backdrop = (LGLiveBackdropView *)glassView;
+        if (!backdrop.lgFilterAttached) [backdrop applyFilters];
     }
 }
 
 void LGScheduleRespringBarGlassRefresh(UIView *respringBar) {
     if (!respringBar) return;
     LGRefreshRespringBarGlass(respringBar);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        LGRefreshRespringBarGlass(respringBar);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        LGRefreshRespringBarGlass(respringBar);
-    });
+    __weak UIView *weakBar = respringBar;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        LGRefreshRespringBarGlass(respringBar);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        LGRefreshRespringBarGlass(respringBar);
+        LGRefreshRespringBarGlass(weakBar);
     });
 }
 
@@ -334,7 +358,9 @@ void LGAnimateSliderToDefault(UISlider *slider, CGFloat targetValue, UILabel *va
     animator.targetValue = targetValue;
     animator.decimals = decimals;
     animator.startTime = CACurrentMediaTime();
-    animator.displayLink = [CADisplayLink displayLinkWithTarget:animator selector:@selector(tick:)];
+    LGHelperDisplayLinkProxy *proxy = [[LGHelperDisplayLinkProxy alloc] init];
+    proxy.target = animator;
+    animator.displayLink = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(tick:)];
     [animator.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     objc_setAssociatedObject(slider, kLGSliderAnimatorKey, animator, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -427,7 +453,7 @@ UIView *LGMakeSectionDivider(void) {
 
 UIBarButtonItem *LGMakeCircularBackItem(id target, SEL action) {
     LGButtonView *button = [[LGButtonView alloc] initWithFrame:CGRectMake(0.0, 0.0, 44.0, 44.0)
-                                                    symbolName:@"chevron.left"
+                                                    symbolName:@"chevron.backward"
                                                     blurRadius:2.0];
     button.clipsToBounds = NO;
     button.layer.masksToBounds = NO;
@@ -490,7 +516,12 @@ static NSNumber *LGParseLocalizedDecimalString(NSString *rawText) {
     if (parsedNumber) return parsedNumber;
 
     NSString *normalized = [trimmed stringByReplacingOccurrencesOfString:@"," withString:@"."];
-    return @([normalized doubleValue]);
+    NSScanner *scanner = [NSScanner scannerWithString:normalized];
+    double value = 0.0;
+    if ([scanner scanDouble:&value] && scanner.isAtEnd && isfinite(value)) {
+        return @(value);
+    }
+    return nil;
 }
 
 static void LGDismissOverlayPanel(UIView *overlay, UIView *panel) {
@@ -775,7 +806,7 @@ void LGPresentTextInputSheet(UIViewController *controller,
         CGRect keyboardFrameScreen = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
         CGRect keyboardFrame = [strongController.view convertRect:keyboardFrameScreen fromView:nil];
         NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-        UIViewAnimationOptions options = (([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16) & UIViewAnimationOptionCurveEaseInOut);
+        UIViewAnimationOptions options = (UIViewAnimationOptions)([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
 
         [strongOverlay layoutIfNeeded];
         CGRect panelFrame = [strongPanel.superview convertRect:strongPanel.frame toView:strongController.view];
@@ -798,7 +829,7 @@ void LGPresentTextInputSheet(UIViewController *controller,
         UIView *strongOverlay = weakOverlay;
         if (!strongOverlay) return;
         NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-        UIViewAnimationOptions options = (([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16) & UIViewAnimationOptionCurveEaseInOut);
+        UIViewAnimationOptions options = (UIViewAnimationOptions)([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
         panelCenterYConstraint.constant = 0.0;
         [UIView animateWithDuration:duration
                               delay:0.0
@@ -808,21 +839,25 @@ void LGPresentTextInputSheet(UIViewController *controller,
         } completion:nil];
     }];
 
+    LGHelperDeallocCleanup *cleanupBox = [[LGHelperDeallocCleanup alloc] init];
+    cleanupBox.cleanupBlock = cleanupObservers;
+    objc_setAssociatedObject(overlay, kLGObserverCleanupKey, cleanupBox, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     [dismissControl addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextField resignFirstResponder];
         cleanupObservers();
-        LGDismissOverlayPanel(overlay, panel);
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
     [cancelButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextField resignFirstResponder];
         cleanupObservers();
-        LGDismissOverlayPanel(overlay, panel);
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
     [applyButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextField resignFirstResponder];
         cleanupObservers();
-        if (applyBlock) applyBlock(textField.text ?: @"");
-        LGDismissOverlayPanel(overlay, panel);
+        if (applyBlock) applyBlock(weakTextField.text ?: @"");
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
 
     [controller.view addSubview:overlay];
@@ -1024,7 +1059,7 @@ void LGPresentMultilineTextInputSheet(UIViewController *controller,
         CGRect keyboardFrameScreen = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
         CGRect keyboardFrame = [strongController.view convertRect:keyboardFrameScreen fromView:nil];
         NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-        UIViewAnimationOptions options = (([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16) & UIViewAnimationOptionCurveEaseInOut);
+        UIViewAnimationOptions options = (UIViewAnimationOptions)([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
 
         [strongOverlay layoutIfNeeded];
         CGRect panelFrame = [strongPanel.superview convertRect:strongPanel.frame toView:strongController.view];
@@ -1047,7 +1082,7 @@ void LGPresentMultilineTextInputSheet(UIViewController *controller,
         UIView *strongOverlay = weakOverlay;
         if (!strongOverlay) return;
         NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-        UIViewAnimationOptions options = (([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16) & UIViewAnimationOptionCurveEaseInOut);
+        UIViewAnimationOptions options = (UIViewAnimationOptions)([note.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue] << 16);
         panelCenterYConstraint.constant = 0.0;
         [UIView animateWithDuration:duration
                               delay:0.0
@@ -1056,23 +1091,28 @@ void LGPresentMultilineTextInputSheet(UIViewController *controller,
             [strongOverlay layoutIfNeeded];
         } completion:nil];
     }];
+
+    LGHelperDeallocCleanup *cleanupBox = [[LGHelperDeallocCleanup alloc] init];
+    cleanupBox.cleanupBlock = cleanupObservers;
+    objc_setAssociatedObject(overlay, kLGObserverCleanupKey, cleanupBox, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     [dismissControl addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextView resignFirstResponder];
         cleanupObservers();
-        LGDismissOverlayPanel(overlay, panel);
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
 
     [cancelButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextView resignFirstResponder];
         cleanupObservers();
-        LGDismissOverlayPanel(overlay, panel);
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
 
     [applyButton addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull _) {
         [weakTextView resignFirstResponder];
         cleanupObservers();
-        if (applyBlock) applyBlock(textView.text ?: @"");
-        LGDismissOverlayPanel(overlay, panel);
+        if (applyBlock) applyBlock(weakTextView.text ?: @"");
+        LGDismissOverlayPanel(weakOverlay, weakPanel);
     }] forControlEvents:UIControlEventTouchUpInside];
 
     [controller.view addSubview:overlay];
@@ -1216,8 +1256,18 @@ UIColor *LGColorFromRGBAHex(NSString *hex) {
 }
 
 NSString *LGRGBAHexFromColor(UIColor *color) {
+    if (!color) return @"#FFFFFF00";
+    UIColor *resolved = [color resolvedColorWithTraitCollection:UITraitCollection.currentTraitCollection];
     CGFloat red = 1.0, green = 1.0, blue = 1.0, alpha = 0.0;
-    if (![color getRed:&red green:&green blue:&blue alpha:&alpha]) return @"#FFFFFF00";
+    if (![resolved getRed:&red green:&green blue:&blue alpha:&alpha]) {
+        CGFloat white = 1.0;
+        if (![resolved getWhite:&white alpha:&alpha]) return @"#FFFFFF00";
+        red = green = blue = white;
+    }
+    red = fmin(fmax(red, 0.0), 1.0);
+    green = fmin(fmax(green, 0.0), 1.0);
+    blue = fmin(fmax(blue, 0.0), 1.0);
+    alpha = fmin(fmax(alpha, 0.0), 1.0);
     return [NSString stringWithFormat:@"#%02X%02X%02X%02X",
             (int)lrint(red * 255.0), (int)lrint(green * 255.0),
             (int)lrint(blue * 255.0), (int)lrint(alpha * 255.0)];

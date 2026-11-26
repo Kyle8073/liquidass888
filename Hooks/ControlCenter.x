@@ -66,7 +66,7 @@ static UIView *ccModuleAncestor(UIView *v) {
 static BOOL ccIsModuleCandidate(UIView *module) {
     CGSize s = module.bounds.size;
     CGFloat mn = fmin(s.width, s.height), mx = fmax(s.width, s.height);
-    if (mn < 20.0) return NO;
+    if (mn < 20.0 || mx > 240.0) return NO;
     return mx <= mn * 1.25;
 }
 
@@ -75,7 +75,7 @@ static CGFloat ccModuleCornerRadius(UIView *module) {
     if (h <= 0.0) return 0.0;
     CGFloat r = h * 0.5;
     if (h < 100.0) { sCCSmallModuleRadius = r; return r; }
-    return sCCSmallModuleRadius > 0.0 ? sCCSmallModuleRadius : r;
+    return sCCSmallModuleRadius > 0.0 ? sCCSmallModuleRadius : 34.0;
 }
 
 static BOOL ccIsSliderView(UIView *view) {
@@ -154,7 +154,19 @@ static CGFloat ccGlassRadiusForMaterial(UIView *mat) {
 
 #pragma mark - fullscreen backdrop styling
 
+@interface LGCCWeakBox : NSObject
+@property (nonatomic, weak) UIView *view;
+@end
+@implementation LGCCWeakBox
++ (instancetype)boxWithView:(UIView *)view {
+    LGCCWeakBox *box = [LGCCWeakBox new];
+    box.view = view;
+    return box;
+}
+@end
+
 static void *kCCFullscreenBlurCapKey = &kCCFullscreenBlurCapKey;
+static void *kCCOriginalBlurValuesKey = &kCCOriginalBlurValuesKey;
 static void *kCCFullscreenDimViewKey = &kCCFullscreenDimViewKey;
 static void *kCCFullscreenMaterialKey = &kCCFullscreenMaterialKey;
 static void *kCCFullscreenOverlayRootKey = &kCCFullscreenOverlayRootKey;
@@ -163,13 +175,43 @@ static NSHashTable<UIView *> *sCCOverlayRoots;
 static CFTimeInterval sCCFullscreenDimSyncDeadline = 0.0;
 static CFTimeInterval sCCFullscreenDimSyncHardDeadline = 0.0;
 
+static BOOL sCCPrefsLoaded = NO;
+static BOOL sCCEnabled = NO;
+static CGFloat sCCBlurRadius = 8.0;
+static UIColor *sCCDimBaseColor = nil;
+static CGFloat sCCDimTargetAlpha = 0.20;
+
 static NSHashTable<UIView *> *ccOverlayRoots(void) {
     if (!sCCOverlayRoots) sCCOverlayRoots = [NSHashTable weakObjectsHashTable];
     return sCCOverlayRoots;
 }
 
+static UIColor *ccColorFromRGBAHex(NSString *hex, NSString *fallback);
+
+static void ccRefreshCachedPrefs(void) {
+    sCCPrefsLoaded = YES;
+    sCCEnabled = lgHostEnabled(@"ControlCenter");
+    sCCBlurRadius = fmax(0.0, LG_prefFloat(@"ControlCenter.FullscreenBackdropBlurRadius", 8.0));
+    NSString *fallback = @"#00000033";
+    UIColor *dimColor = ccColorFromRGBAHex(
+        LG_prefString(@"ControlCenter.FullscreenBackdropDimColor", fallback), fallback);
+    sCCDimTargetAlpha = CGColorGetAlpha(dimColor.CGColor);
+    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 0.0;
+    if ([dimColor getRed:&red green:&green blue:&blue alpha:&alpha]) {
+        sCCDimBaseColor = [UIColor colorWithRed:red green:green blue:blue alpha:1.0];
+    } else {
+        sCCDimBaseColor = [dimColor colorWithAlphaComponent:1.0];
+    }
+}
+
+static BOOL ccControlCenterEnabled(void) {
+    if (!sCCPrefsLoaded) ccRefreshCachedPrefs();
+    return sCCEnabled;
+}
+
 static CGFloat ccFullscreenBlurRadius(void) {
-    return fmax(0.0, LG_prefFloat(@"ControlCenter.FullscreenBackdropBlurRadius", 8.0));
+    if (!sCCPrefsLoaded) ccRefreshCachedPrefs();
+    return sCCBlurRadius;
 }
 
 static UIColor *ccColorFromRGBAHex(NSString *hex, NSString *fallback) {
@@ -200,22 +242,14 @@ static UIColor *ccColorFromRGBAHex(NSString *hex, NSString *fallback) {
     return [UIColor colorWithRed:red green:green blue:blue alpha:alpha];
 }
 
-static UIColor *ccFullscreenDimColor(void) {
-    NSString *fallback = @"#00000033";
-    return ccColorFromRGBAHex(LG_prefString(@"ControlCenter.FullscreenBackdropDimColor", fallback), fallback);
-}
-
 static CGFloat ccFullscreenDimTargetAlpha(void) {
-    return CGColorGetAlpha(ccFullscreenDimColor().CGColor);
+    if (!sCCPrefsLoaded) ccRefreshCachedPrefs();
+    return sCCDimTargetAlpha;
 }
 
 static UIColor *ccFullscreenDimBaseColor(void) {
-    UIColor *color = ccFullscreenDimColor();
-    CGFloat red = 0.0, green = 0.0, blue = 0.0, alpha = 0.0;
-    if ([color getRed:&red green:&green blue:&blue alpha:&alpha]) {
-        return [UIColor colorWithRed:red green:green blue:blue alpha:1.0];
-    }
-    return [color colorWithAlphaComponent:1.0];
+    if (!sCCPrefsLoaded) ccRefreshCachedPrefs();
+    return sCCDimBaseColor ?: UIColor.blackColor;
 }
 
 static BOOL ccIsBlurRadiusKey(NSString *key) {
@@ -248,9 +282,18 @@ static void ccClampBlurFilter(id filter, CGFloat radius) {
     // blur radius keys changed names across ios releases
     if (!filter) return;
     ccSetBlurCapMarker(filter, YES);
+    NSMutableDictionary *originals = objc_getAssociatedObject(filter, kCCOriginalBlurValuesKey);
     for (NSString *key in @[@"inputRadius", @"radius", @"inputBlurRadius", @"blurRadius"]) {
         @try {
             id value = [filter valueForKey:key];
+            if ([value respondsToSelector:@selector(doubleValue)] && !originals[key]) {
+                if (!originals) {
+                    originals = [NSMutableDictionary dictionary];
+                    objc_setAssociatedObject(filter, kCCOriginalBlurValuesKey, originals,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                originals[key] = value;
+            }
             id clamped = ccClampedBlurRadiusValue(value, radius);
             if (clamped != value) [filter setValue:clamped forKey:key];
         } @catch (__unused NSException *exception) {
@@ -258,22 +301,44 @@ static void ccClampBlurFilter(id filter, CGFloat radius) {
     }
 }
 
+static void ccRestoreBlurFilter(id filter) {
+    if (!filter) return;
+    ccSetBlurCapMarker(filter, NO);
+    NSDictionary *originals = objc_getAssociatedObject(filter, kCCOriginalBlurValuesKey);
+    if (originals) {
+        [originals enumerateKeysAndObjectsUsingBlock:^(NSString *key, id value, __unused BOOL *stop) {
+            @try { [filter setValue:value forKey:key]; }
+            @catch (__unused NSException *exception) {}
+        }];
+        objc_setAssociatedObject(filter, kCCOriginalBlurValuesKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
 static void ccSetBlurCapOnFilters(id filters, BOOL enabled, CGFloat radius) {
     if (![filters isKindOfClass:NSArray.class]) return;
     for (id filter in (NSArray *)filters) {
         if (enabled) ccClampBlurFilter(filter, radius);
-        else ccSetBlurCapMarker(filter, NO);
+        else ccRestoreBlurFilter(filter);
     }
 }
 
 static void ccAssociateOverlayRootWithFilters(id filters, UIView *overlayRoot) {
     if (![filters isKindOfClass:NSArray.class]) return;
+    LGCCWeakBox *box = overlayRoot ? [LGCCWeakBox boxWithView:overlayRoot] : nil;
     for (id filter in (NSArray *)filters) {
         objc_setAssociatedObject(filter,
                                  kCCFullscreenOverlayRootKey,
-                                 overlayRoot,
-                                 OBJC_ASSOCIATION_ASSIGN);
+                                 box,
+                                 box ? OBJC_ASSOCIATION_RETAIN_NONATOMIC : OBJC_ASSOCIATION_ASSIGN);
     }
+}
+
+static UIView *ccAssociatedOverlayRoot(id object) {
+    id stored = objc_getAssociatedObject(object, kCCFullscreenOverlayRootKey);
+    if ([stored isKindOfClass:LGCCWeakBox.class]) {
+        return ((LGCCWeakBox *)stored).view;
+    }
+    return nil;
 }
 
 static void ccSetBlurCapOnLayerTree(CALayer *layer, BOOL enabled, CGFloat radius) {
@@ -409,9 +474,10 @@ static void ccApplyFullscreenBackdropStyleImpl(UIView *overlayRoot) {
     if (!overlayRoot) return;
     [ccOverlayRoots() addObject:overlayRoot];
 
-    BOOL enabled = lgHostEnabled(@"ControlCenter");
+    BOOL enabled = ccControlCenterEnabled();
     CGFloat radius = ccFullscreenBlurRadius();
-    UIView *previousBackdropMaterial = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+    LGCCWeakBox *prevBox = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+    UIView *previousBackdropMaterial = [prevBox isKindOfClass:LGCCWeakBox.class] ? prevBox.view : nil;
     UIView *backdropMaterial = nil;
 
     for (UIView *subview in [overlayRoot.subviews copy]) {
@@ -442,12 +508,12 @@ static void ccApplyFullscreenBackdropStyleImpl(UIView *overlayRoot) {
 
     objc_setAssociatedObject(overlayRoot,
                              kCCFullscreenMaterialKey,
-                             backdropMaterial,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             [LGCCWeakBox boxWithView:backdropMaterial],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(backdropMaterial.layer,
                              kCCFullscreenOverlayRootKey,
-                             overlayRoot,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             [LGCCWeakBox boxWithView:overlayRoot],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ccAssociateOverlayRootWithFilters(backdropMaterial.layer.filters, overlayRoot);
     @try {
         ccAssociateOverlayRootWithFilters([backdropMaterial.layer valueForKey:@"backgroundFilters"],
@@ -484,20 +550,25 @@ static void ccApplyFullscreenBackdropStyle(UIView *overlayRoot) {
     ccProfileRecord(CCProfileFullscreen, started);
 }
 
+static UIView *ccFullscreenMaterialForRoot(UIView *overlayRoot) {
+    id box = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+    return [box isKindOfClass:LGCCWeakBox.class] ? ((LGCCWeakBox *)box).view : nil;
+}
+
 static void ccSyncFullscreenDimForRootImpl(UIView *overlayRoot) {
     if (!overlayRoot) return;
 
-    UIView *backdropMaterial = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+    UIView *backdropMaterial = ccFullscreenMaterialForRoot(overlayRoot);
     if (!backdropMaterial || backdropMaterial.superview != overlayRoot) {
         ccApplyFullscreenBackdropStyle(overlayRoot);
-        backdropMaterial = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+        backdropMaterial = ccFullscreenMaterialForRoot(overlayRoot);
     }
     if (!backdropMaterial) return;
 
     UIView *dimView = ccFullscreenDimView(backdropMaterial, NO);
     if (!dimView) return;
 
-    CGFloat targetAlpha = lgHostEnabled(@"ControlCenter")
+    CGFloat targetAlpha = ccControlCenterEnabled()
         ? ccFullscreenDimTargetAlpha()
         : 0.0;
     if (targetAlpha <= 0.001) {
@@ -510,9 +581,12 @@ static void ccSyncFullscreenDimForRootImpl(UIView *overlayRoot) {
 
     CGFloat cap = ccFullscreenBlurRadius();
     CGFloat presentedRadius = ccPresentedBlurRadiusInLayerTree(backdropMaterial.layer);
-    CGFloat progress = 1.0;
+    CGFloat progress = 0.0;
     if (cap > 0.001 && presentedRadius >= 0.0) {
         progress = fmin(1.0, fmax(0.0, presentedRadius / cap));
+    } else if (cap <= 0.001) {
+        CALayer *sampleLayer = backdropMaterial.layer.presentationLayer ?: backdropMaterial.layer;
+        progress = fmin(1.0, fmax(0.0, sampleLayer.opacity));
     }
 
     dimView.alpha = targetAlpha * progress;
@@ -526,7 +600,7 @@ static void ccSyncFullscreenDimForRoot(UIView *overlayRoot) {
 
 static void ccSetFullscreenDimAlpha(UIView *overlayRoot, CGFloat alpha) {
     if (!overlayRoot) return;
-    UIView *backdropMaterial = objc_getAssociatedObject(overlayRoot, kCCFullscreenMaterialKey);
+    UIView *backdropMaterial = ccFullscreenMaterialForRoot(overlayRoot);
     UIView *dimView = ccFullscreenDimView(backdropMaterial, NO);
     if (!dimView) return;
     dimView.alpha = fmin(1.0, fmax(0.0, alpha));
@@ -552,7 +626,7 @@ static void ccStopFullscreenDimSync(UIView *overlayRoot);
 
     ccSyncFullscreenDimForRoot(root);
 
-    UIView *material = objc_getAssociatedObject(root, kCCFullscreenMaterialKey);
+    UIView *material = ccFullscreenMaterialForRoot(root);
     CGFloat modelRadius = material ? ccModelBlurRadiusInLayerTree(material.layer) : -1.0;
     CGFloat presentedRadius = material ? ccPresentedBlurRadiusInLayerTree(material.layer) : -1.0;
     CFTimeInterval now = CACurrentMediaTime();
@@ -663,7 +737,7 @@ static void ccRestoreAllRoundedViews(void) {
 
 static void lgRound(UIView *v, CGFloat r) {
     if (!v) return;
-    if (!lgHostEnabled(@"ControlCenter") || ccHasSBElasticHierarchy(v)) {
+    if (!ccControlCenterEnabled() || ccHasSBElasticHierarchy(v)) {
         ccRestoreRoundState(v);
         return;
     }
@@ -681,7 +755,7 @@ static void lgRound(UIView *v, CGFloat r) {
 }
 
 static void ccApplyOrRestoreRound(UIView *view, CGFloat radius, BOOL eligible) {
-    if (!eligible || !lgHostEnabled(@"ControlCenter") || ccHasSBElasticHierarchy(view)) {
+    if (!eligible || !ccControlCenterEnabled() || ccHasSBElasticHierarchy(view)) {
         ccRestoreRoundState(view);
         return;
     }
@@ -903,7 +977,7 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
-
+    ccStopFullscreenDimSync(((UIViewController *)self).viewIfLoaded);
 }
 
 - (void)viewDidLayoutSubviews {
@@ -918,8 +992,8 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 
 - (void)setValue:(id)value forKey:(NSString *)key {
     UIView *overlayRoot = nil;
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter") && ccIsBlurRadiusKey(key)) {
-        overlayRoot = objc_getAssociatedObject(self, kCCFullscreenOverlayRootKey);
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled() && ccIsBlurRadiusKey(key)) {
+        overlayRoot = ccAssociatedOverlayRoot(self);
         value = ccClampedBlurRadiusValue(value, ccFullscreenBlurRadius());
     }
     %orig(value, key);
@@ -928,10 +1002,10 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 
 - (void)setValue:(id)value forKeyPath:(NSString *)keyPath {
     UIView *overlayRoot = nil;
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter") && [keyPath isKindOfClass:NSString.class]) {
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled() && [keyPath isKindOfClass:NSString.class]) {
         NSString *lastKey = [keyPath componentsSeparatedByString:@"."].lastObject;
         if (ccIsBlurRadiusKey(lastKey)) {
-            overlayRoot = objc_getAssociatedObject(self, kCCFullscreenOverlayRootKey);
+            overlayRoot = ccAssociatedOverlayRoot(self);
             value = ccClampedBlurRadiusValue(value, ccFullscreenBlurRadius());
         }
     }
@@ -951,8 +1025,8 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 - (void)setFilters:(NSArray *)filters {
     UIView *overlayRoot = nil;
     CGFloat incomingBlurRadius = -1.0;
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter")) {
-        overlayRoot = objc_getAssociatedObject(self, kCCFullscreenOverlayRootKey);
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled()) {
+        overlayRoot = ccAssociatedOverlayRoot(self);
         incomingBlurRadius = ccBlurRadiusFromFilters(filters);
         ccAssociateOverlayRootWithFilters(filters, overlayRoot);
         ccSetBlurCapOnFilters(filters, YES, ccFullscreenBlurRadius());
@@ -967,8 +1041,8 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 - (void)setValue:(id)value forKey:(NSString *)key {
     UIView *overlayRoot = nil;
     CGFloat incomingBlurRadius = -1.0;
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter") && [key isEqualToString:@"backgroundFilters"]) {
-        overlayRoot = objc_getAssociatedObject(self, kCCFullscreenOverlayRootKey);
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled() && [key isEqualToString:@"backgroundFilters"]) {
+        overlayRoot = ccAssociatedOverlayRoot(self);
         incomingBlurRadius = ccBlurRadiusFromFilters(value);
         ccAssociateOverlayRootWithFilters(value, overlayRoot);
         ccSetBlurCapOnFilters(value, YES, ccFullscreenBlurRadius());
@@ -980,7 +1054,7 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 }
 
 - (void)setValue:(id)value forKeyPath:(NSString *)keyPath {
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter") && [keyPath isKindOfClass:NSString.class]) {
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled() && [keyPath isKindOfClass:NSString.class]) {
         NSString *lastKey = [keyPath componentsSeparatedByString:@"."].lastObject;
         if (ccIsBlurRadiusKey(lastKey)) {
             value = ccClampedBlurRadiusValue(value, ccFullscreenBlurRadius());
@@ -990,7 +1064,7 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 }
 
 - (void)addAnimation:(CAAnimation *)animation forKey:(NSString *)key {
-    if (ccObjectHasBlurCap(self) && lgHostEnabled(@"ControlCenter")) {
+    if (ccObjectHasBlurCap(self) && ccControlCenterEnabled()) {
         ccClampBlurAnimation(animation, ccFullscreenBlurRadius());
     }
     NSNumber *desired = objc_getAssociatedObject(self, kCCRoundDesiredRadiusKey);
@@ -1016,7 +1090,8 @@ static void ccRefreshContentContainerGlass(UIView *container) {
 
 %ctor {
     lgObservePreferenceReload(^{
-        if (!lgHostEnabled(@"ControlCenter")) ccRestoreAllRoundedViews();
+        ccRefreshCachedPrefs();
+        if (!ccControlCenterEnabled()) ccRestoreAllRoundedViews();
         for (UIView *root in ccOverlayRoots().allObjects) {
             ccApplyFullscreenBackdropStyle(root);
             ccKickFullscreenDimSync(root);

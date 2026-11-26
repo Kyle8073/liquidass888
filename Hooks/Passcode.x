@@ -23,6 +23,10 @@ static void *kPCReleaseTokenKey   = &kPCReleaseTokenKey;
 static void *kPCBgColorKey        = &kPCBgColorKey;
 static void *kPCBgAlphaKey        = &kPCBgAlphaKey;
 static void *kPCBgOpaqueKey       = &kPCBgOpaqueKey;
+static void *kPCBgClipsKey        = &kPCBgClipsKey;
+static void *kPCBgRadiusKey       = &kPCBgRadiusKey;
+static void *kPCBgCurveKey        = &kPCBgCurveKey;
+static void *kPCBgMasksKey        = &kPCBgMasksKey;
 
 static BOOL sPasscodeVisible = NO;
 
@@ -133,15 +137,38 @@ static void pcRememberBg(UIView *host) {
         objc_setAssociatedObject(host, kPCBgAlphaKey, @(host.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!objc_getAssociatedObject(host, kPCBgOpaqueKey))
         objc_setAssociatedObject(host, kPCBgOpaqueKey, @(host.opaque), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!objc_getAssociatedObject(host, kPCBgClipsKey))
+        objc_setAssociatedObject(host, kPCBgClipsKey, @(host.clipsToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!objc_getAssociatedObject(host, kPCBgRadiusKey))
+        objc_setAssociatedObject(host, kPCBgRadiusKey, @(host.layer.cornerRadius), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!objc_getAssociatedObject(host, kPCBgCurveKey))
+        objc_setAssociatedObject(host, kPCBgCurveKey, host.layer.cornerCurve ?: kCACornerCurveCircular, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    if (!objc_getAssociatedObject(host, kPCBgMasksKey))
+        objc_setAssociatedObject(host, kPCBgMasksKey, @(host.layer.masksToBounds), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void pcRestoreBg(UIView *host) {
     id color = objc_getAssociatedObject(host, kPCBgColorKey);
     id alpha = objc_getAssociatedObject(host, kPCBgAlphaKey);
     id opaque = objc_getAssociatedObject(host, kPCBgOpaqueKey);
+    id clips = objc_getAssociatedObject(host, kPCBgClipsKey);
+    id radius = objc_getAssociatedObject(host, kPCBgRadiusKey);
+    id curve = objc_getAssociatedObject(host, kPCBgCurveKey);
+    id masks = objc_getAssociatedObject(host, kPCBgMasksKey);
     if (color)  host.backgroundColor = (color == [NSNull null]) ? nil : color;
     if (alpha)  host.alpha  = [alpha doubleValue];
     if (opaque) host.opaque = [opaque boolValue];
+    if (clips)  host.clipsToBounds = [clips boolValue];
+    if (radius) host.layer.cornerRadius = [radius doubleValue];
+    if (curve)  host.layer.cornerCurve = curve;
+    if (masks)  host.layer.masksToBounds = [masks boolValue];
+    objc_setAssociatedObject(host, kPCBgColorKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgOpaqueKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgClipsKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgRadiusKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgCurveKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(host, kPCBgMasksKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
 static void injectPasscodeButton(UIView *button) {
@@ -182,7 +209,7 @@ static void injectPasscodeButton(UIView *button) {
     glass.layer.cornerRadius  = r;
     glass.layer.cornerCurve   = kCACornerCurveCircular;
     glass.layer.masksToBounds = YES;
-    [glass applyFilters];
+    if (freshInject) [glass applyFilters];
     lgTrackGlass(glass, @"Passcode", nil);
 
     UIView *tint = objc_getAssociatedObject(host, kPCTintKey);
@@ -199,15 +226,21 @@ static void injectPasscodeButton(UIView *button) {
     tint.layer.masksToBounds = YES;
     [host bringSubviewToFront:tint];
 
-    objc_setAssociatedObject(button, kPCHostKey, host, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(button, kPCHostKey, host, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     BOOL highlighted = [objc_getAssociatedObject(button, kPCHighlightedKey) boolValue];
     if (freshInject || prev != host) pcApplyVisualState(host, highlighted, NO);
     else tint.backgroundColor = pcTargetTint(highlighted);
 }
 
 static void resetPasscodeButton(UIView *button) {
+    NSUInteger token = [objc_getAssociatedObject(button, kPCReleaseTokenKey) unsignedIntegerValue] + 1;
+    objc_setAssociatedObject(button, kPCReleaseTokenKey, @(token), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *host = objc_getAssociatedObject(button, kPCHostKey) ?: pcButtonHost(button);
-    if (!host) return;
+    if (!host) {
+        objc_setAssociatedObject(button, kPCHostKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(button, kPCHighlightedKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        return;
+    }
     UIViewPropertyAnimator *a = objc_getAssociatedObject(host, kPCAnimatorKey);
     if (a) { [a stopAnimation:YES]; objc_setAssociatedObject(host, kPCAnimatorKey, nil, OBJC_ASSOCIATION_ASSIGN); }
     LGLiveBackdropView *glass = objc_getAssociatedObject(host, kPCGlassKey);
@@ -250,7 +283,7 @@ static void setPasscodeButtonHighlighted(UIView *button, BOOL highlighted) {
     __weak UIView *wb = button, *wh = host;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIView *sb = wb, *sh = wh;
-        if (!sb || !sh) return;
+        if (!sb || !sh || !lgHostEnabled(@"Passcode")) return;
         if ([objc_getAssociatedObject(sb, kPCHighlightedKey) boolValue]) return;
         if ([objc_getAssociatedObject(sb, kPCReleaseTokenKey) unsignedIntegerValue] != token) return;
         pcApplyVisualState(sh, NO, YES);
@@ -287,17 +320,18 @@ static void setPasscodeSuppressed(UIView *v, BOOL suppressed) {
                          completion:^(__unused BOOL fin) { if (sPasscodeVisible) v.hidden = YES; }];
     } else {
         NSNumber *alpha = objc_getAssociatedObject(v, kPCSuppAlphaKey);
+        NSNumber *savedHidden = objc_getAssociatedObject(v, kPCSuppHiddenKey);
+        if (!alpha && !savedHidden) return;
+        objc_setAssociatedObject(v, kPCSuppAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(v, kPCSuppHiddenKey, nil, OBJC_ASSOCIATION_ASSIGN);
         [v.layer removeAllAnimations];
         v.hidden = NO;
         [UIView animateWithDuration:0.2 delay:0.0
                             options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction | UIViewAnimationOptionCurveEaseInOut
                          animations:^{ v.alpha = alpha ? alpha.doubleValue : 1.0; }
                          completion:^(__unused BOOL fin) {
-            NSNumber *h = objc_getAssociatedObject(v, kPCSuppHiddenKey);
-            if (h) v.hidden = h.boolValue;
+            if (!sPasscodeVisible && savedHidden) v.hidden = savedHidden.boolValue;
         }];
-        objc_setAssociatedObject(v, kPCSuppAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject(v, kPCSuppHiddenKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
 }
 
@@ -377,6 +411,7 @@ static void restorePasscodeForDisable(void) {
 - (void)didMoveToWindow { %orig; updatePasscodeVisible(passcodeBackgroundVisible((UIView *)self)); }
 - (void)layoutSubviews  { %orig; updatePasscodeVisible(passcodeBackgroundVisible((UIView *)self)); }
 - (void)setHidden:(BOOL)hidden { %orig; updatePasscodeVisible(passcodeBackgroundVisible((UIView *)self)); }
+- (void)setAlpha:(CGFloat)alpha { %orig; updatePasscodeVisible(passcodeBackgroundVisible((UIView *)self)); }
 %end
 
 %ctor {

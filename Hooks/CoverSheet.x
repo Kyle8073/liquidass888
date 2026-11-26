@@ -47,6 +47,8 @@ static CGPoint sLGCoverSheetLockedVisualPinOffset;
 static NSMutableArray<UIView *> *sLGCoverSheetLockedBranchPinViews;
 static NSMutableArray<NSValue *> *sLGCoverSheetLockedBranchPinTransforms;
 static BOOL sLGCoverSheetLockedBranchPinSawPasscodeVisible;
+static CFTimeInterval sLGCoverSheetBranchPinWatchStartedAt;
+static CFTimeInterval sLGCoverSheetLastActivityTime;
 static BOOL sLGCoverSheetLastKnownLocked;
 static BOOL sLGCoverSheetPerformingFade;
 static BOOL sLGCoverSheetFadeToHome;
@@ -140,6 +142,8 @@ static UIDeviceOrientation LGCoverSheetDeviceOrientation(UIView *view) {
         CGPoint yAxis = CGPointMake(py.x - p0.x, py.y - p0.y);
         BOOL portraitBasis = fabs(xAxis.x) > fabs(xAxis.y) &&
                              fabs(yAxis.y) > fabs(yAxis.x);
+        BOOL landscapeBasis = fabs(xAxis.y) > fabs(xAxis.x) &&
+                              fabs(yAxis.x) > fabs(yAxis.y);
         if (portraitBasis && xAxis.x < 0.0 && yAxis.y < 0.0) {
             sLGCoverSheetLastPortraitOrientation =
                 UIDeviceOrientationPortraitUpsideDown;
@@ -153,6 +157,22 @@ static UIDeviceOrientation LGCoverSheetDeviceOrientation(UIView *view) {
             LGCoverSheetLogOrientation(view, UIDeviceOrientationPortrait,
                                        @"fixed-space-portrait", xAxis, yAxis);
             return UIDeviceOrientationPortrait;
+        }
+        if (landscapeBasis && xAxis.y > 0.0 && yAxis.x < 0.0) {
+            sLGCoverSheetLastLandscapeOrientation =
+                UIDeviceOrientationLandscapeLeft;
+            LGCoverSheetLogOrientation(
+                view, UIDeviceOrientationLandscapeLeft,
+                @"fixed-space-landscape-left", xAxis, yAxis);
+            return UIDeviceOrientationLandscapeLeft;
+        }
+        if (landscapeBasis && xAxis.y < 0.0 && yAxis.x > 0.0) {
+            sLGCoverSheetLastLandscapeOrientation =
+                UIDeviceOrientationLandscapeRight;
+            LGCoverSheetLogOrientation(
+                view, UIDeviceOrientationLandscapeRight,
+                @"fixed-space-landscape-right", xAxis, yAxis);
+            return UIDeviceOrientationLandscapeRight;
         }
     }
 
@@ -183,6 +203,22 @@ static UIDeviceOrientation LGCoverSheetDeviceOrientation(UIView *view) {
                                    @"window-scene-portrait",
                                    CGPointZero, CGPointZero);
         return UIDeviceOrientationPortrait;
+    }
+    if (interfaceOrientation == UIInterfaceOrientationLandscapeRight) {
+        sLGCoverSheetLastLandscapeOrientation =
+            UIDeviceOrientationLandscapeLeft;
+        LGCoverSheetLogOrientation(view, UIDeviceOrientationLandscapeLeft,
+                                   @"window-scene-landscape-left",
+                                   CGPointZero, CGPointZero);
+        return UIDeviceOrientationLandscapeLeft;
+    }
+    if (interfaceOrientation == UIInterfaceOrientationLandscapeLeft) {
+        sLGCoverSheetLastLandscapeOrientation =
+            UIDeviceOrientationLandscapeRight;
+        LGCoverSheetLogOrientation(view, UIDeviceOrientationLandscapeRight,
+                                   @"window-scene-landscape-right",
+                                   CGPointZero, CGPointZero);
+        return UIDeviceOrientationLandscapeRight;
     }
 
     UIDeviceOrientation orientation = deviceOrientation;
@@ -528,14 +564,23 @@ static void LGCoverSheetWatchBranchPinsForPasscodeDismissal(void) {
         return;
     }
 
-    if (sLGCoverSheetLockedBranchPinViews.count == 0) return;
+    if (sLGCoverSheetLockedBranchPinViews.count == 0) {
+        sLGCoverSheetBranchPinWatchStartedAt = 0.0;
+        return;
+    }
+
+    if (sLGCoverSheetBranchPinWatchStartedAt <= 0.0) {
+        sLGCoverSheetBranchPinWatchStartedAt = CACurrentMediaTime();
+    }
 
     BOOL visible = LGCoverSheetPasscodeModelVisible();
     if (visible) {
         if (!sLGCoverSheetLockedBranchPinSawPasscodeVisible) {
             sLGCoverSheetLockedBranchPinSawPasscodeVisible = YES;
         }
-    } else if (sLGCoverSheetLockedBranchPinSawPasscodeVisible) {
+    } else if (sLGCoverSheetLockedBranchPinSawPasscodeVisible ||
+               (CACurrentMediaTime() - sLGCoverSheetBranchPinWatchStartedAt >= 2.5)) {
+        sLGCoverSheetBranchPinWatchStartedAt = 0.0;
         LGCoverSheetReleaseLockedBranchPins();
         return;
     }
@@ -794,6 +839,7 @@ static LGLiveBackdropView *LGCoverSheetEnsureGlass(UIView *panel) {
     }
     if (!glass) {
         glass = LGCreateRegisteredGlass(panel.frame, nil, @"CoverSheet");
+        if (!glass) return nil;
         glass.autoresizingMask = UIViewAutoresizingNone;
         glass.userInteractionEnabled = NO;
         glass.backgroundColor = UIColor.clearColor;
@@ -811,9 +857,9 @@ static LGLiveBackdropView *LGCoverSheetEnsureGlass(UIView *panel) {
     return glass;
 }
 
-static void LGCoverSheetSyncGlassGeometry(UIView *panel,
+static BOOL LGCoverSheetSyncGlassGeometry(UIView *panel,
                                           LGLiveBackdropView *glass) {
-    if (!panel || !glass || glass.superview != panel.superview) return;
+    if (!panel || !glass || glass.superview != panel.superview) return NO;
     CFTimeInterval profileStart = CACurrentMediaTime();
 
     // presentation geometry keeps the glass attached during interactive pulls
@@ -832,22 +878,21 @@ static void LGCoverSheetSyncGlassGeometry(UIView *panel,
                  !CATransform3DEqualToTransform(glass.layer.transform,
                                                 sourceLayer.transform);
 
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    glass.layer.anchorPoint = sourceLayer.anchorPoint;
-    glass.layer.bounds = sourceLayer.bounds;
-    glass.layer.position = sourceLayer.position;
-    glass.layer.transform = sourceLayer.transform;
-    [CATransaction commit];
-    if (moved) LGScheduleClockRecoveryRefreshForPresentationChange();
-    if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode) &&
-        [NSThread isMainThread]) {
-        [CATransaction flush];
+    if (moved) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        glass.layer.anchorPoint = sourceLayer.anchorPoint;
+        glass.layer.bounds = sourceLayer.bounds;
+        glass.layer.position = sourceLayer.position;
+        glass.layer.transform = sourceLayer.transform;
+        [CATransaction commit];
+        sLGCoverSheetLastActivityTime = CACurrentMediaTime();
+        LGScheduleClockRecoveryRefreshForPresentationChange();
     }
 
     LGCoverSheetUpdateBottomCornerMask(glass);
 
-    if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) {
+    if (moved && LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) {
 
         CGPoint captureOrigin = glass.frame.origin;
         if (glass.window) {
@@ -876,7 +921,10 @@ static void LGCoverSheetSyncGlassGeometry(UIView *panel,
             scale, (uint32_t)deviceOrientation);
     }
     LGCoverSheetProfileSample(CACurrentMediaTime() - profileStart, 0.0, NO);
+    return moved;
 }
+
+static void LGCoverSheetSetMode(LGCoverSheetMode mode);
 
 @interface LGCoverSheetDisplayLinkTarget : NSObject
 - (void)lg_coverSheetDisplayLinkTick:(CADisplayLink *)displayLink;
@@ -887,12 +935,18 @@ static void LGCoverSheetSyncGlassGeometry(UIView *panel,
     (void)displayLink;
     if (!LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) return;
     CFTimeInterval start = CACurrentMediaTime();
+    BOOL anyMoved = NO;
     for (UIView *panel in sLGCoverSheetPanels.allObjects) {
         LGLiveBackdropView *glass =
             objc_getAssociatedObject(panel, kLGCoverSheetGlassKey);
         if (glass && !glass.hidden) {
-            LGCoverSheetSyncGlassGeometry(panel, glass);
+            anyMoved |= LGCoverSheetSyncGlassGeometry(panel, glass);
         }
+    }
+    if (!anyMoved && sLGCoverSheetLastActivityTime > 0.0 &&
+        (start - sLGCoverSheetLastActivityTime) >= 3.0) {
+        LGCoverSheetSetMode(LGCoverSheetModeIdle);
+        return;
     }
     LGCoverSheetProfileSample(0.0, CACurrentMediaTime() - start, YES);
 }
@@ -944,7 +998,7 @@ static void LGCoverSheetCrossfadeToLockscreen(UIView *panel,
     NSArray<UIViewController *> *wallpaperControllers =
         sLGCoverSheetWallpaperControllers.allObjects;
     for (UIViewController *controller in wallpaperControllers) {
-        UIView *wallpaperView = controller.view;
+        UIView *wallpaperView = controller.viewIfLoaded;
         if (!wallpaperView.window || wallpaperView.hidden) continue;
         LGCoverSheetAddOpacityFade(wallpaperView, wallpaperView.alpha);
     }
@@ -958,10 +1012,11 @@ static void LGCoverSheetCrossfadeToLockscreen(UIView *panel,
                      animations:^{
         glass.alpha = 0.0;
     } completion:^(__unused BOOL finished) {
-        glass.hidden = YES;
-        glass.alpha = 1.0;
         objc_setAssociatedObject(panel, kLGCoverSheetFadeKey, nil,
                                  OBJC_ASSOCIATION_ASSIGN);
+        if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) return;
+        glass.hidden = YES;
+        glass.alpha = 1.0;
     }];
 }
 
@@ -988,13 +1043,20 @@ static void LGCoverSheetCrossfadeToHome(UIView *panel,
         glass.alpha = 0.0;
         snapshot.alpha = 0.0;
     } completion:^(__unused BOOL finished) {
+        objc_setAssociatedObject(panel, kLGCoverSheetFadeKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) {
+        objc_setAssociatedObject(panel, kLGCoverSheetFadeKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        [glass.layer removeAnimationForKey:@"opacity"];
+            LGCoverSheetRemoveWallpaperSnapshot(panel);
+            return;
+        }
         CGFloat alpha = LGCoverSheetRestorePanelVisibility(panel);
         panel.alpha = alpha;
         glass.hidden = YES;
         glass.alpha = 1.0;
         LGCoverSheetRemoveWallpaperSnapshot(panel);
-        objc_setAssociatedObject(panel, kLGCoverSheetFadeKey, nil,
-                                 OBJC_ASSOCIATION_ASSIGN);
         LGCoverSheetConsumeDeferredDismissalCommit();
     }];
 }
@@ -1025,6 +1087,9 @@ static void LGCoverSheetSyncPanel(UIView *panel) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) {
+        objc_setAssociatedObject(panel, kLGCoverSheetFadeKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        [glass.layer removeAnimationForKey:@"opacity"];
         if (!objc_getAssociatedObject(panel,
                                       kLGCoverSheetOriginalHiddenKey)) {
             objc_setAssociatedObject(
@@ -1096,7 +1161,9 @@ static void LGCoverSheetSetMode(LGCoverSheetMode mode) {
     sLGCoverSheetPerformingFade =
         fadeToLockscreen || sLGCoverSheetFadeToHome;
     sLGCoverSheetCommitEndPresented = NO;
-    if (!LGCoverSheetModeUsesGlass(mode)) {
+    if (LGCoverSheetModeUsesGlass(mode)) {
+        sLGCoverSheetLastActivityTime = CACurrentMediaTime();
+    } else {
         LGCoverSheetWriteSharedState(false, 0.0f, 0.0f, 0.0f, 0u);
     }
     LGCoverSheetSetDisplayLinkActive(
@@ -1142,14 +1209,12 @@ static void LGCoverSheetSetMode(LGCoverSheetMode mode) {
 
 - (void)viewDidLoad {
     %orig;
-    if (LGCoverSheetEnabled())
-        LGCoverSheetRegisterWallpaperController((UIViewController *)self);
+    LGCoverSheetRegisterWallpaperController((UIViewController *)self);
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    if (LGCoverSheetEnabled())
-        LGCoverSheetRegisterWallpaperController((UIViewController *)self);
+    LGCoverSheetRegisterWallpaperController((UIViewController *)self);
 }
 
 %end
@@ -1221,6 +1286,9 @@ static void LGCoverSheetHandleAnimationTick(id self, id controller, double progr
                                             BOOL gestureActive,
                                             BOOL forPresentationValue,
                                             void (^callOrig)(void)) {
+    if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode)) {
+        sLGCoverSheetLastActivityTime = CACurrentMediaTime();
+    }
     BOOL terminalModelTick =
         sLGCoverSheetLockedHandoffActive &&
         !forPresentationValue && !gestureActive && progress >= 0.999;
@@ -1291,6 +1359,9 @@ static void LGCoverSheetHandleTransitionEnd(id self, id controller,
 
     if (!trackingRollback) {
         callOrig();
+        if (LGCoverSheetModeUsesGlass(sLGCoverSheetMode) && !sLGCoverSheetPerformingFade) {
+            LGCoverSheetSetMode(LGCoverSheetModeIdle);
+        }
         return;
     }
 
@@ -1311,13 +1382,17 @@ static void LGCoverSheetHandleTransitionEnd(id self, id controller,
     id managerCopy = (id)self;
     id controllerCopy = controller;
     dispatch_async(dispatch_get_main_queue(), ^{
-        LGCoverSheetRequestLockedPasscode(managerCopy, controllerCopy);
+        if (!LGCoverSheetRequestLockedPasscode(managerCopy, controllerCopy)) {
+            LGCoverSheetReleaseLockedVisualPin();
+            return;
+        }
 
         NSUInteger transferred =
             LGCoverSheetTransferRootPinToNonPasscodeBranches(controllerCopy);
         LGCoverSheetReleaseLockedVisualPin();
 
         if (transferred > 0) {
+            sLGCoverSheetBranchPinWatchStartedAt = CACurrentMediaTime();
             LGCoverSheetWatchBranchPinsForPasscodeDismissal();
         }
     });

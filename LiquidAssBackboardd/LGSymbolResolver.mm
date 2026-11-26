@@ -4,6 +4,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
+#include <os/lock.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -62,24 +63,42 @@ static void rlog(const char *fmt, ...) {
 
 static uint8_t  *g_qcTextBase  = nullptr;
 static size_t    g_qcTextSize  = 0;
-// vtable pointers can live outside text so keep the full mapped span
-static uint8_t  *g_qcImageLo   = nullptr;
-static uint8_t  *g_qcImageHi   = nullptr;
+struct LGSegmentRange {
+    uint8_t *lo;
+    uint8_t *hi;
+};
+static const int kMaxQuartzCoreSegments = 32;
+static LGSegmentRange g_qcSegments[kMaxQuartzCoreSegments];
+static int       g_qcSegmentCount = 0;
 static intptr_t  g_qcSlide     = 0;
 static bool      g_inited      = false;
+static os_unfair_lock g_initLock = OS_UNFAIR_LOCK_INIT;
+
+static bool LGSymRangeInQuartzCoreText(const void *ptr, size_t byteLen) {
+    if (!g_inited || !ptr || !g_qcTextBase || byteLen > g_qcTextSize) return false;
+    if (((uintptr_t)ptr & 3u) != 0) return false;
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)g_qcTextBase;
+    return addr >= base && (addr - base) <= (g_qcTextSize - byteLen);
+}
 
 bool LGSymResolverInit(void) {
     // every scanner depends on the quartzcore slide and mapped ranges
-    if (g_inited) return true;
+    os_unfair_lock_lock(&g_initLock);
+    if (g_inited) {
+        os_unfair_lock_unlock(&g_initLock);
+        return true;
+    }
 
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name || !strstr(name, "QuartzCore")) continue;
 
-        g_qcSlide = _dyld_get_image_vmaddr_slide(i);
         const struct mach_header_64 *hdr =
             (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        g_qcSlide = _dyld_get_image_vmaddr_slide(i);
 
         unsigned long textSize = 0;
         uint8_t *textData = getsegmentdata((struct mach_header_64 *)hdr,
@@ -89,25 +108,32 @@ bool LGSymResolverInit(void) {
             g_qcTextSize = textSize;
         }
 
+        g_qcSegmentCount = 0;
         const uint8_t *cmdPtr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
-        for (uint32_t c = 0; c < hdr->ncmds; c++) {
+        const uint8_t *cmdsEnd = cmdPtr + hdr->sizeofcmds;
+        for (uint32_t c = 0; c < hdr->ncmds && cmdPtr + sizeof(struct load_command) <= cmdsEnd; c++) {
             const struct load_command *lc = (const struct load_command *)cmdPtr;
-            if (lc->cmd == LC_SEGMENT_64) {
+            if (lc->cmdsize < sizeof(struct load_command) || cmdPtr + lc->cmdsize > cmdsEnd) break;
+            if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
                 const struct segment_command_64 *seg =
                     (const struct segment_command_64 *)lc;
-                uint8_t *segLo = (uint8_t *)(seg->vmaddr + g_qcSlide);
-                uint8_t *segHi = segLo + seg->vmsize;
-                if (!g_qcImageLo || segLo < g_qcImageLo) g_qcImageLo = segLo;
-                if (!g_qcImageHi || segHi > g_qcImageHi) g_qcImageHi = segHi;
+                if (seg->vmsize > 0 && g_qcSegmentCount < kMaxQuartzCoreSegments) {
+                    uint8_t *segLo = (uint8_t *)(seg->vmaddr + g_qcSlide);
+                    uint8_t *segHi = segLo + seg->vmsize;
+                    g_qcSegments[g_qcSegmentCount++] = { segLo, segHi };
+                }
             }
             cmdPtr += lc->cmdsize;
         }
 
-        g_inited = (g_qcTextBase != nullptr);
-        rlog("init: QuartzCore slide=%#tx __TEXT=%p size=%#zx fullImage=[%p,%p)",
-             g_qcSlide, g_qcTextBase, g_qcTextSize, g_qcImageLo, g_qcImageHi);
-        return g_inited;
+        g_inited = (g_qcTextBase != nullptr && g_qcTextSize > 0);
+        rlog("init: QuartzCore slide=%#tx __TEXT=%p size=%#zx segments=%d",
+             g_qcSlide, g_qcTextBase, g_qcTextSize, g_qcSegmentCount);
+        bool ok = g_inited;
+        os_unfair_lock_unlock(&g_initLock);
+        return ok;
     }
+    os_unfair_lock_unlock(&g_initLock);
     rlog("init: QuartzCore image not found");
     return false;
 }
@@ -133,7 +159,7 @@ static uint8_t *rawScan(const uint8_t *needle, size_t needleLen,
 
 void *LGSymScanText(const uint8_t *pattern, const char *mask, size_t patternLen) {
     // x bytes match exactly and every other mask byte is a wildcard
-    if (!g_inited) return nullptr;
+    if (!g_inited || !pattern || !mask || patternLen == 0 || patternLen > g_qcTextSize) return nullptr;
     uint8_t *end = g_qcTextBase + g_qcTextSize - patternLen;
     for (uint8_t *p = g_qcTextBase; p <= end; p++) {
         bool match = true;
@@ -155,7 +181,7 @@ static inline bool isADRP(uint32_t instr) {
     return (instr & 0x9F000000) == 0x90000000;
 }
 static inline bool isADD_imm(uint32_t instr) {
-    return (instr & 0x7F800000) == 0x11000000;
+    return (instr & 0xFF800000) == 0x91000000;
 }
 static inline bool isLDR_uoff64(uint32_t instr) {
     return (instr & 0xFFC00000) == 0xF9400000;
@@ -193,11 +219,16 @@ static int64_t signExtend(uint64_t v, int bits) {
 }
 
 void *LGSymDecodeAdrpAdd(void *adrpInstrAddr) {
+    if (!adrpInstrAddr) return nullptr;
     uint32_t *p = (uint32_t *)adrpInstrAddr;
     if (!isADRP(p[0])) { rlog("decodeAdrpAdd: not ADRP at %p", p); return nullptr; }
     if (!isADD_imm(p[1])) { rlog("decodeAdrpAdd: not ADD at %p", p + 1); return nullptr; }
 
     uint32_t adrp = p[0], add = p[1];
+    if ((adrp & 0x1Fu) != ((add >> 5) & 0x1Fu)) {
+        rlog("decodeAdrpAdd: register mismatch at %p", p);
+        return nullptr;
+    }
     uint64_t immlo = (adrp >> 29) & 0x3;
     uint64_t immhi = (adrp >> 5)  & 0x7FFFF;
     int64_t  pageOff = signExtend((immhi << 2) | immlo, 21) << 12;
@@ -213,11 +244,16 @@ void *LGSymDecodeAdrpAdd(void *adrpInstrAddr) {
 }
 
 void *LGSymDecodeAdrpLdr(void *adrpInstrAddr) {
+    if (!adrpInstrAddr) return nullptr;
     uint32_t *p = (uint32_t *)adrpInstrAddr;
     if (!isADRP(p[0])) { rlog("decodeAdrpLdr: not ADRP at %p", p); return nullptr; }
     if (!isLDR_uoff64(p[1])) { rlog("decodeAdrpLdr: not LDR at %p", p + 1); return nullptr; }
 
     uint32_t adrp = p[0], ldr = p[1];
+    if ((adrp & 0x1Fu) != ((ldr >> 5) & 0x1Fu)) {
+        rlog("decodeAdrpLdr: register mismatch at %p", p);
+        return nullptr;
+    }
     uint64_t immlo = (adrp >> 29) & 0x3;
     uint64_t immhi = (adrp >> 5)  & 0x7FFFF;
     int64_t  pageOff = signExtend((immhi << 2) | immlo, 21) << 12;
@@ -278,6 +314,7 @@ struct GaussianSiteInfo {
 
 static GaussianSiteInfo g_gaussianSite;
 static bool g_gaussianSiteScanned = false;
+static os_unfair_lock g_gaussianScanLock = OS_UNFAIR_LOCK_INIT;
 
 static void *matchAddFilterCallAt(uint32_t *p, uint32_t *limit, void **outCtx,
                                   uint32_t *outAtom) {
@@ -305,9 +342,11 @@ static void *matchAddFilterCallAt(uint32_t *p, uint32_t *limit, void **outCtx,
 
 static void scanGaussianSite(void) {
     // atom values move between builds so find the registration cluster
-    if (g_gaussianSiteScanned) return;
-    g_gaussianSiteScanned = true;
-    if (!g_inited) return;
+    os_unfair_lock_lock(&g_gaussianScanLock);
+    if (g_gaussianSiteScanned || !g_inited) {
+        os_unfair_lock_unlock(&g_gaussianScanLock);
+        return;
+    }
 
     uint32_t *base  = (uint32_t *)g_qcTextBase;
     uint32_t *limit = (uint32_t *)(g_qcTextBase + g_qcTextSize) - 8;
@@ -384,14 +423,18 @@ static void scanGaussianSite(void) {
         g_gaussianSite.gaussianCtxPtr  = gaussianCtx;
         g_gaussianSite.filterTableSlot = filterTableSlot;
         g_gaussianSite.valid = true;
+        g_gaussianSiteScanned = true;
 
         rlog("scanGaussianSite: confirmed cluster of %d calls, start=%p gaussIdx=%d atom=0x%x",
              matchCount, clusterStart, gaussIdx, matchAtoms[gaussIdx]);
         rlog("  add_filter = %p", firstTarget);
         rlog("  gaussian ctx = %p", gaussianCtx);
         rlog("  filter_table slot = %p", filterTableSlot);
+        os_unfair_lock_unlock(&g_gaussianScanLock);
         return;
     }
+    g_gaussianSiteScanned = true;
+    os_unfair_lock_unlock(&g_gaussianScanLock);
     rlog("scanGaussianSite: no confirmed add_filter cluster found");
 }
 
@@ -490,20 +533,26 @@ ptrdiff_t LGResolve_MetalCmdBufOffset(void) {
     uint32_t thisMask = 1u;
     for (int i = 0; i < 48 && (q + i) < end; i++) {
         uint32_t ins = q[i];
+        if (isBL(ins)) {
+            thisMask &= ~0x7FFFFu;
+            continue;
+        }
         if (isMOVreg(ins)) {
             uint32_t src = (ins >> 16) & 0x1f, dst = ins & 0x1f;
-            if ((thisMask >> src) & 1) thisMask |= (1u << dst);
-            else                       thisMask &= ~(1u << dst);
+            if (dst < 31) {
+                if (src < 31 && ((thisMask >> src) & 1)) thisMask |= (1u << dst);
+                else                                     thisMask &= ~(1u << dst);
+            }
             continue;
         }
         if (isLDRSTR_uimm64(ins)) {
             uint32_t bn = (ins >> 5) & 0x1f, rt = ins & 0x1f;
             uint32_t imm = ((ins >> 10) & 0xfff) << 3;
-            if (((thisMask >> bn) & 1) && imm >= 0x400) {
+            if (bn < 31 && ((thisMask >> bn) & 1) && imm >= 0x400) {
                 rlog("cmdbuf: MetalContext command-buffer offset = %#x", imm);
                 return (ptrdiff_t)imm;
             }
-            if (ins & 0x00400000) thisMask &= ~(1u << rt);
+            if ((ins & 0x00400000) && rt < 31) thisMask &= ~(1u << rt);
         }
     }
     rlog("cmdbuf: command-buffer field access not found");
@@ -517,7 +566,7 @@ int LGResolve_RenderVtableSlot(void * const *vtable, int maxSlots) {
     for (int i = 0; i + 1 < maxSlots; i++) {
 
         uint32_t *fn = (uint32_t *)LGSymStripCode(vtable[i]);
-        if (!fn || !LGSymAddressInQuartzCoreImage((void *)fn)) continue;
+        if (!LGSymRangeInQuartzCoreText((void *)fn, 38 * sizeof(uint32_t))) continue;
 
         for (int k = 0; k + 1 < 24; k++) {
             uint32_t ins = fn[k];
@@ -571,7 +620,7 @@ int LGResolve_EdgeInfoVtableSlot(void * const *vtable, int maxSlots) {
 
     for (int i = 0; i < maxSlots; i++) {
         uint32_t *fn = (uint32_t *)LGSymStripCode(vtable[i]);
-        if (!fn || !LGSymAddressInQuartzCoreImage((void *)fn)) continue;
+        if (!LGSymRangeInQuartzCoreText((void *)fn, 80 * sizeof(uint32_t))) continue;
 
         bool savesEdge = false;
         bool savesFlag = false;
@@ -596,19 +645,28 @@ int LGResolve_EdgeInfoVtableSlot(void * const *vtable, int maxSlots) {
 
 bool LGSymAddressInQuartzCoreImage(void *addr) {
     if (!g_inited || !addr) return false;
-    return (addr >= (void *)g_qcImageLo && addr < (void *)g_qcImageHi);
+    uint8_t *p = (uint8_t *)addr;
+    for (int i = 0; i < g_qcSegmentCount; i++) {
+        if (p >= g_qcSegments[i].lo && p < g_qcSegments[i].hi) return true;
+    }
+    return false;
 }
 
 void LGSymResolverSaveCache(void) {
     NSBundle *qc = [NSBundle bundleWithPath:@"/System/Library/Frameworks/QuartzCore.framework"];
     NSString *version = qc.infoDictionary[@"CFBundleVersion"] ?: @"unknown";
 
+    void *addFilter = LGResolve_AddFilter();
+    void *stopEncoders = LGResolve_StopEncoders();
+    void *gaussCtx = (void *)LGResolve_GaussianCtxSlot();
+    void *filterTable = (void *)LGResolve_FilterTableSlot();
+
     NSDictionary *cache = @{
         @"qcVersion"      : version,
-        @"addFilter"      : @((uintptr_t)LGResolve_AddFilter() - g_qcSlide),
-        @"stopEncoders"   : @((uintptr_t)LGResolve_StopEncoders() - g_qcSlide),
-        @"gaussianCtxSlot": @((uintptr_t)LGResolve_GaussianCtxSlot() - g_qcSlide),
-        @"filterTableSlot": @((uintptr_t)LGResolve_FilterTableSlot() - g_qcSlide),
+        @"addFilter"      : @(addFilter ? ((uintptr_t)addFilter - (uintptr_t)g_qcSlide) : 0),
+        @"stopEncoders"   : @(stopEncoders ? ((uintptr_t)stopEncoders - (uintptr_t)g_qcSlide) : 0),
+        @"gaussianCtxSlot": @(gaussCtx ? ((uintptr_t)gaussCtx - (uintptr_t)g_qcSlide) : 0),
+        @"filterTableSlot": @(filterTable ? ((uintptr_t)filterTable - (uintptr_t)g_qcSlide) : 0),
     };
     [cache writeToFile:@"/tmp/lg_symcache.plist" atomically:YES];
     rlog("cache saved for QuartzCore version %s", version.UTF8String);

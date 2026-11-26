@@ -86,6 +86,18 @@ static BOOL LGSwitchAncestorIsScrolling(UIView *view) {
     return NO;
 }
 
+@interface LGSwitchDisplayLinkProxy : NSObject
+@property (nonatomic, weak) id target;
+@end
+
+@implementation LGSwitchDisplayLinkProxy
+- (void)handleDisplayLink:(CADisplayLink *)link {
+    id t = self.target;
+    if (t) [t performSelector:@selector(handleDisplayLink:) withObject:link];
+    else [link invalidate];
+}
+@end
+
 @interface LGPrefsLiquidSwitch ()
 @property (nonatomic, strong) UIView *trackView;
 @property (nonatomic, strong) UIView *fillView;
@@ -93,6 +105,7 @@ static BOOL LGSwitchAncestorIsScrolling(UIView *view) {
 @property (nonatomic, strong) LGLiveBackdropView *glassThumbView;
 @property (nonatomic, strong) UIImpactFeedbackGenerator *feedbackGenerator;
 @property (nonatomic, strong) CADisplayLink *displayLink;
+@property (nonatomic, assign) NSUInteger autoContractGeneration;
 @property (nonatomic, assign) CGFloat renderedProgress;
 @property (nonatomic, assign) CGFloat targetProgress;
 @property (nonatomic, assign) CGSize renderedThumbSize;
@@ -129,14 +142,18 @@ static CGSize LGSettingsSwitchExpandedThumbSize(void) {
 }
 
 static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
+    NSUInteger generation = ++self_.autoContractGeneration;
+    __weak LGPrefsLiquidSwitch *weakSelf = self_;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self_.pressed) return;
-        self_.pendingTapAutoContract = NO;
-        self_.targetExpansion = 0.0;
-        self_.targetThumbSize = LGSettingsSwitchRestThumbSize();
-        [self_ startDisplayLinkIfNeeded];
-        [self_ refreshGlassBackdrop];
-        [self_ updateVisualsAnimated:YES];
+        LGPrefsLiquidSwitch *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.pressed ||
+            strongSelf.autoContractGeneration != generation) return;
+        strongSelf.pendingTapAutoContract = NO;
+        strongSelf.targetExpansion = 0.0;
+        strongSelf.targetThumbSize = LGSettingsSwitchRestThumbSize();
+        [strongSelf startDisplayLinkIfNeeded];
+        [strongSelf refreshGlassBackdrop];
+        [strongSelf updateVisualsAnimated:YES];
     });
 }
 
@@ -198,6 +215,13 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
     self.contractedThumbView = contractedThumbView;
     [self addSubview:contractedThumbView];
 
+    [self updateMaterialColors];
+    [self syncRenderedStateImmediately];
+    [self updateVisualsAnimated:NO];
+}
+
+- (LGLiveBackdropView *)ensureGlassThumbView {
+    if (self.glassThumbView) return self.glassThumbView;
     LGLiveBackdropView *glass = [[LGLiveBackdropView alloc] initWithFrame:CGRectZero
                                                                groupName:nil
                                                               filterType:LGFilterTypeForHostPrefix(@"PrefsSwitch")];
@@ -206,10 +230,8 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
     glass.hidden = YES;
     self.glassThumbView = glass;
     [self addSubview:glass];
-
     [self updateMaterialColors];
-    [self syncRenderedStateImmediately];
-    [self updateVisualsAnimated:NO];
+    return glass;
 }
 
 - (void)didMoveToWindow {
@@ -526,7 +548,9 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
 - (void)startDisplayLinkIfNeeded {
     if (self.displayLink || !self.window) return;
     self.lastDisplayLinkTimestamp = 0.0;
-    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(handleDisplayLink:)];
+    LGSwitchDisplayLinkProxy *proxy = [[LGSwitchDisplayLinkProxy alloc] init];
+    proxy.target = self;
+    self.displayLink = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(handleDisplayLink:)];
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
@@ -539,7 +563,7 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
 - (void)handleDisplayLink:(CADisplayLink *)link {
     LGRecordSwitchLifecycle(@"tick", self);
 
-    if (LGSwitchAncestorIsScrolling(self)) {
+    if (!self.window || LGSwitchAncestorIsScrolling(self)) {
         self.pressed = NO;
         self.dragMoved = NO;
         self.isDragging = NO;
@@ -605,10 +629,12 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
     self.contractedThumbView.layer.shadowRadius = 5.0;
     self.contractedThumbView.layer.shadowOffset = CGSizeZero;
 
-    self.glassThumbView.layer.shadowColor = UIColor.blackColor.CGColor;
-    self.glassThumbView.layer.shadowOpacity = darkMode ? 0.12 : 0.08;
-    self.glassThumbView.layer.shadowRadius = darkMode ? 7.0 : 4.0;
-    self.glassThumbView.layer.shadowOffset = darkMode ? CGSizeMake(0.0, 2.0) : CGSizeMake(0.0, 1.0);
+    if (self.glassThumbView) {
+        self.glassThumbView.layer.shadowColor = UIColor.blackColor.CGColor;
+        self.glassThumbView.layer.shadowOpacity = darkMode ? 0.12 : 0.08;
+        self.glassThumbView.layer.shadowRadius = darkMode ? 7.0 : 4.0;
+        self.glassThumbView.layer.shadowOffset = darkMode ? CGSizeMake(0.0, 2.0) : CGSizeMake(0.0, 1.0);
+    }
 }
 
 - (void)refreshGlassBackdrop {}
@@ -633,23 +659,35 @@ static void LGSettingsSwitchScheduleAutoContract(LGPrefsLiquidSwitch *self_) {
                                    self.renderedThumbSize.width,
                                    self.renderedThumbSize.height);
 
-    self.contractedThumbView.layer.cornerRadius = 12.0;
-    self.glassThumbView.layer.cornerRadius = CGRectGetHeight(glassFrame) * 0.5;
-    self.glassThumbView.hidden = NO;
-    self.contractedThumbView.hidden = NO;
     (void)animated;
     CGFloat expansion = fmax(0.0, fmin(self.renderedExpansion, 1.0));
     CGFloat visualExpansion = expansion * expansion * (3.0 - (2.0 * expansion));
     CGFloat contractedScale = 1.0 + (0.06 * visualExpansion);
     CGFloat glassScale = 0.92 + (0.08 * visualExpansion);
-    self.contractedThumbView.frame = contractedFrame;
-    self.glassThumbView.frame = glassFrame;
-    self.glassThumbView.alpha = visualExpansion;
+
+    self.contractedThumbView.layer.cornerRadius = 12.0;
+    self.contractedThumbView.bounds = CGRectMake(0.0, 0.0,
+                                                 CGRectGetWidth(contractedFrame),
+                                                 CGRectGetHeight(contractedFrame));
+    self.contractedThumbView.center = CGPointMake(CGRectGetMidX(contractedFrame),
+                                                  CGRectGetMidY(contractedFrame));
     self.contractedThumbView.alpha = 1.0 - visualExpansion;
-    self.glassThumbView.transform = CGAffineTransformMakeScale(glassScale, glassScale);
     self.contractedThumbView.transform = CGAffineTransformMakeScale(contractedScale, contractedScale);
-    self.glassThumbView.hidden = visualExpansion < 0.01;
     self.contractedThumbView.hidden = visualExpansion > 0.99;
+
+    BOOL needsGlass = visualExpansion >= 0.01 || self.pressed || self.targetExpansion > 0.01 || self.displayLink != nil;
+    if (needsGlass && self.window) [self ensureGlassThumbView];
+    if (self.glassThumbView) {
+        self.glassThumbView.layer.cornerRadius = CGRectGetHeight(glassFrame) * 0.5;
+        self.glassThumbView.bounds = CGRectMake(0.0, 0.0,
+                                            CGRectGetWidth(glassFrame),
+                                            CGRectGetHeight(glassFrame));
+        self.glassThumbView.center = CGPointMake(CGRectGetMidX(glassFrame),
+                                             CGRectGetMidY(glassFrame));
+        self.glassThumbView.alpha = visualExpansion;
+        self.glassThumbView.transform = CGAffineTransformMakeScale(glassScale, glassScale);
+        self.glassThumbView.hidden = visualExpansion < 0.01;
+    }
 }
 
 @end
