@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <notify.h>
+#include <os/lock.h>
 
 enum {
     LGLensRectSlotPrefsSegment = 0,
@@ -37,16 +38,26 @@ static inline const char *LGLensRectNotifyName(uint32_t slotIndex) {
 static inline int LGLensRectToken(uint32_t slotIndex) {
     static int sTokens[LGLensRectSlotCount];
     static bool sRegistered[LGLensRectSlotCount];
+    static os_unfair_lock sTokenLock = OS_UNFAIR_LOCK_INIT;
     if (slotIndex >= (uint32_t)LGLensRectSlotCount) return -1;
+    os_unfair_lock_lock(&sTokenLock);
     if (!sRegistered[slotIndex]) {
         const char *name = LGLensRectNotifyName(slotIndex);
-        if (!name) return -1;
+        if (!name) {
+            os_unfair_lock_unlock(&sTokenLock);
+            return -1;
+        }
         int token = 0;
-        if (notify_register_check(name, &token) != NOTIFY_STATUS_OK) return -1;
+        if (notify_register_check(name, &token) != NOTIFY_STATUS_OK) {
+            os_unfair_lock_unlock(&sTokenLock);
+            return -1;
+        }
         sTokens[slotIndex] = token;
         sRegistered[slotIndex] = true;
     }
-    return sTokens[slotIndex];
+    int result = sTokens[slotIndex];
+    os_unfair_lock_unlock(&sTokenLock);
+    return result;
 }
 
 #define LG_LENS_RECT_RATIO_MIN  (-0.5f)

@@ -86,10 +86,14 @@
 @end
 
 static UIImage *CreateRadialGlowImage(CGFloat diameter) {
+    if (diameter <= 0.5 || !isfinite(diameter)) return nil;
     CGSize size = CGSizeMake(diameter, diameter);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return nil;
+    if (!ctx) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     NSArray *colors = @[(id)[UIColor colorWithWhite:1.0 alpha:0.95].CGColor,
@@ -117,6 +121,8 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
 @interface LGSpecularHighlightView ()
 @property (nonatomic, strong) CAGradientLayer *specularRim;
 @property (nonatomic, strong) CAShapeLayer *rimMask;
+@property (nonatomic, assign) CGRect lastMaskBounds;
+@property (nonatomic, assign) CGFloat lastMaskRadius;
 @end
 
 @implementation LGSpecularHighlightView
@@ -132,6 +138,8 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
         _strokeWidth = 1.5;
         _topSpecularOpacity = 0.65;
         _bottomSpecularOpacity = 0.35;
+        _lastMaskBounds = CGRectNull;
+        _lastMaskRadius = -1.0;
         self.userInteractionEnabled = NO;
         self.backgroundColor = UIColor.clearColor;
         self.specularRim = [CAGradientLayer layer];
@@ -153,7 +161,9 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
 }
 
 - (void)setCornerRadius:(CGFloat)cornerRadius {
+    if (fabs(_cornerRadius - cornerRadius) < 0.01) return;
     _cornerRadius = cornerRadius;
+    _lastMaskBounds = CGRectNull;
     self.rimMask.path = [UIBezierPath bezierPathWithRoundedRect:self.bounds
                                                   cornerRadius:cornerRadius].CGPath;
 }
@@ -162,15 +172,26 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
     [super layoutSubviews];
     self.specularRim.frame = self.bounds;
     self.rimMask.lineWidth = self.strokeWidth;
-    self.rimMask.path = [UIBezierPath bezierPathWithRoundedRect:self.bounds
-                                                  cornerRadius:self.cornerRadius].CGPath;
+    if (!CGRectEqualToRect(_lastMaskBounds, self.bounds) ||
+        fabs(_lastMaskRadius - self.cornerRadius) >= 0.01) {
+        _lastMaskBounds = self.bounds;
+        _lastMaskRadius = self.cornerRadius;
+        self.rimMask.path = [UIBezierPath bezierPathWithRoundedRect:self.bounds
+                                                      cornerRadius:self.cornerRadius].CGPath;
+    }
 }
 
 @end
 
-@implementation LGButtonView
+@implementation LGButtonView {
+    CGRect _lastButtonMaskBounds;
+    CGFloat _lastButtonMaskRadius;
+    BOOL _lastButtonMaskCircular;
+}
 
 - (void)commonInitWithBlurRadius:(CGFloat)blurRadius {
+    _lastButtonMaskBounds = CGRectNull;
+    _lastButtonMaskRadius = -1.0;
     self.clipsToBounds = NO;
     self.layer.masksToBounds = NO;
     self.backgroundColor = [UIColor clearColor];
@@ -304,6 +325,20 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
     [self unclipHierarchy];
 }
 
+- (void)willMoveToWindow:(UIWindow *)newWindow {
+    [super willMoveToWindow:newWindow];
+    if (!newWindow && self.isPressed) {
+        self.isPressed = NO;
+        self.touchCycleId++;
+        if (self.navigationController && self.navigationController.interactivePopGestureRecognizer) {
+            self.navigationController.interactivePopGestureRecognizer.enabled = YES;
+        }
+        [self updateShapeWithTransform:CGAffineTransformIdentity shiftX:0 shiftY:0];
+        self.innerGlowView.transform = CGAffineTransformIdentity;
+        self.innerGlowView.alpha = 0.0;
+    }
+}
+
 - (void)didMoveToWindow {
     [super didMoveToWindow];
     [self unclipHierarchy];
@@ -334,15 +369,22 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
         self.darkTintView.layer.cornerCurve = curve;
     }
 
-    UIBezierPath *path = isCircular ?
-        [UIBezierPath bezierPathWithOvalInRect:self.backgroundContainer.bounds] :
-        [UIBezierPath bezierPathWithRoundedRect:self.backgroundContainer.bounds cornerRadius:radius];
+    if (!CGRectEqualToRect(_lastButtonMaskBounds, self.backgroundContainer.bounds) ||
+        fabs(_lastButtonMaskRadius - radius) >= 0.01 ||
+        _lastButtonMaskCircular != isCircular) {
+        _lastButtonMaskBounds = self.backgroundContainer.bounds;
+        _lastButtonMaskRadius = radius;
+        _lastButtonMaskCircular = isCircular;
+        UIBezierPath *path = isCircular ?
+            [UIBezierPath bezierPathWithOvalInRect:self.backgroundContainer.bounds] :
+            [UIBezierPath bezierPathWithRoundedRect:self.backgroundContainer.bounds cornerRadius:radius];
 
-    if (self.backgroundContainer.layer.mask && [self.backgroundContainer.layer.mask isKindOfClass:[CAShapeLayer class]]) {
-        ((CAShapeLayer *)self.backgroundContainer.layer.mask).path = path.CGPath;
-    }
-    if (self.specularMaskLayer) {
-        self.specularMaskLayer.path = path.CGPath;
+        if (self.backgroundContainer.layer.mask && [self.backgroundContainer.layer.mask isKindOfClass:[CAShapeLayer class]]) {
+            ((CAShapeLayer *)self.backgroundContainer.layer.mask).path = path.CGPath;
+        }
+        if (self.specularMaskLayer) {
+            self.specularMaskLayer.path = path.CGPath;
+        }
     }
     if (self.menuAnchorButton) {
         self.menuAnchorButton.frame = self.bounds;
@@ -355,76 +397,22 @@ static UIImage *CreateRadialGlowImage(CGFloat diameter) {
     self.layer.zPosition = 9999;
 
     UIView *cur = self.superview;
-    while (cur) {
+    int depth = 0;
+    while (cur && depth < 3) {
+        if ([cur isKindOfClass:UIWindow.class] ||
+            [cur isKindOfClass:UIScrollView.class] ||
+            [cur isKindOfClass:UITableView.class] ||
+            [cur isKindOfClass:UICollectionView.class]) {
+            break;
+        }
         cur.clipsToBounds = NO;
         cur.layer.masksToBounds = NO;
+        if ([cur isKindOfClass:UINavigationBar.class]) {
+            break;
+        }
         cur = cur.superview;
+        depth++;
     }
-}
-
-static void LGDumpSubviewsAndLayers(UIView *view, int indent, NSMutableString *out) {
-    if (!view) return;
-    NSString *ind = [@"" stringByPaddingToLength:indent * 2 withString:@" " startingAtIndex:0];
-    CALayer *l = view.layer;
-    [out appendFormat:@"%@V[%@]: frame=%@ bounds=%@ clips=%d masks=%d mask=%@ radius=%.1f transform=%@\n",
-        ind, NSStringFromClass(view.class), NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds),
-        view.clipsToBounds, l.masksToBounds, l.mask ? NSStringFromClass(l.mask.class) : @"nil",
-        l.cornerRadius, NSStringFromCGAffineTransform(view.transform)];
-
-    for (CALayer *sublayer in l.sublayers) {
-        if (sublayer.delegate != (id)view) {
-            [out appendFormat:@"%@  L[%@]: frame=%@ bounds=%@ masks=%d mask=%@ radius=%.1f\n",
-                ind, NSStringFromClass(sublayer.class), NSStringFromCGRect(sublayer.frame), NSStringFromCGRect(sublayer.bounds),
-                sublayer.masksToBounds, sublayer.mask ? NSStringFromClass(sublayer.mask.class) : @"nil",
-                sublayer.cornerRadius];
-        }
-    }
-
-    for (UIView *sub in view.subviews) {
-        LGDumpSubviewsAndLayers(sub, indent + 1, out);
-    }
-}
-
-static void LGDumpButtonHierarchy(UIView *view) {
-    @try {
-        NSMutableString *str = [NSMutableString string];
-        [str appendFormat:@"\n=== LGButtonView Hierarchy Dump ===\n"];
-        [str appendFormat:@"--- Button Tree ---\n"];
-        LGDumpSubviewsAndLayers(view, 0, str);
-
-        [str appendFormat:@"--- Layer Superlayers ---\n"];
-        CALayer *curLayer = view.layer;
-        int layerDepth = 0;
-        while (curLayer) {
-            [str appendFormat:@"Layer[%d]: %@, frame=%@, bounds=%@, masks=%d, mask=%@, cornerRadius=%.1f, zPos=%.1f\n",
-                layerDepth, NSStringFromClass(curLayer.class), NSStringFromCGRect(curLayer.frame), NSStringFromCGRect(curLayer.bounds),
-                curLayer.masksToBounds, curLayer.mask ? NSStringFromClass(curLayer.mask.class) : @"nil",
-                curLayer.cornerRadius, curLayer.zPosition];
-            curLayer = curLayer.superlayer;
-            layerDepth++;
-        }
-
-        [str appendFormat:@"--- View Superviews ---\n"];
-        UIView *cur = view.superview;
-        int depth = 1;
-        while (cur) {
-            [str appendFormat:@"Super[%d]: %@, frame: %@, bounds: %@, clips: %d, masks: %d, hasMaskLayer: %d, zPos: %.1f\n",
-                depth, NSStringFromClass(cur.class), NSStringFromCGRect(cur.frame), NSStringFromCGRect(cur.bounds),
-                cur.clipsToBounds, cur.layer.masksToBounds, (cur.layer.mask != nil), cur.layer.zPosition];
-            cur = cur.superview;
-            depth++;
-        }
-
-        if (view.superview) {
-            [str appendFormat:@"--- Siblings in Superview (%@) ---\n", NSStringFromClass(view.superview.class)];
-            for (UIView *sib in view.superview.subviews) {
-                [str appendFormat:@"Sibling: %@, frame: %@, hidden: %d, alpha: %.2f, zPos: %.1f\n",
-                    NSStringFromClass(sib.class), NSStringFromCGRect(sib.frame), sib.hidden, sib.alpha, sib.layer.zPosition];
-            }
-        }
-
-        [str writeToFile:@"/var/tmp/button_obstruction_dump.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } @catch (...) {}
 }
 
 - (void)updateShapeWithTransform:(CGAffineTransform)transform shiftX:(CGFloat)shiftX shiftY:(CGFloat)shiftY {
@@ -481,9 +469,11 @@ static void LGDumpButtonHierarchy(UIView *view) {
 - (void)lg_menuButtonTouchDown {
     [self handleTouchDownAtPoint:CGPointMake(self.bounds.size.width / 2.0, self.bounds.size.height / 2.0)];
     uint64_t currentCycle = self.touchCycleId;
+    __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (self.isPressed && self.touchCycleId == currentCycle) {
-            [self handleTouchEnded];
+        LGButtonView *strongSelf = weakSelf;
+        if (strongSelf && strongSelf.isPressed && strongSelf.touchCycleId == currentCycle) {
+            [strongSelf handleTouchEnded];
         }
     });
 }
@@ -528,13 +518,16 @@ static void LGDumpButtonHierarchy(UIView *view) {
     [self handleTouchEnded];
 
     if (dist < 55.0) {
+        __weak typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (self.actionHandler) {
-                self.actionHandler();
-            } else if (self.primaryMenu) {
-                [self presentMenu];
+            LGButtonView *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (strongSelf.actionHandler) {
+                strongSelf.actionHandler();
+            } else if (strongSelf.primaryMenu) {
+                [strongSelf presentMenu];
             } else {
-                [self sendActionsForControlEvents:UIControlEventTouchUpInside];
+                [strongSelf sendActionsForControlEvents:UIControlEventTouchUpInside];
             }
         });
     } else {
@@ -560,7 +553,6 @@ static void LGDumpButtonHierarchy(UIView *view) {
     self.touchCycleId++;
 
     [self unclipHierarchy];
-    LGDumpButtonHierarchy(self);
 
     if (self.navigationController && self.navigationController.interactivePopGestureRecognizer) {
         self.navigationController.interactivePopGestureRecognizer.enabled = NO;
@@ -642,12 +634,14 @@ static void LGDumpButtonHierarchy(UIView *view) {
     NSTimeInterval delay = (elapsed < minPressDuration) ? (minPressDuration - elapsed) : 0.0;
 
     uint64_t currentCycle = self.touchCycleId;
+    __weak typeof(self) weakSelf = self;
     void (^performBounceRelease)(void) = ^{
-        if (self.touchCycleId != currentCycle || self.isPressed) return;
+        LGButtonView *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.touchCycleId != currentCycle || strongSelf.isPressed) return;
         [UIView animateWithDuration:0.52 delay:0 usingSpringWithDamping:0.44 initialSpringVelocity:1.8 options:UIViewAnimationOptionAllowUserInteraction animations:^{
-            [self updateShapeWithTransform:CGAffineTransformIdentity shiftX:0 shiftY:0];
-            self.innerGlowView.transform = CGAffineTransformIdentity;
-            self.innerGlowView.alpha = 0.0;
+            [strongSelf updateShapeWithTransform:CGAffineTransformIdentity shiftX:0 shiftY:0];
+            strongSelf.innerGlowView.transform = CGAffineTransformIdentity;
+            strongSelf.innerGlowView.alpha = 0.0;
         } completion:nil];
     };
 

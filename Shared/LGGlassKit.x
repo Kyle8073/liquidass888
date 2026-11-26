@@ -1,6 +1,7 @@
 #import "LGGlassKit.h"
 #import "LGLiveBackdropView.h"
 #import "LGHostRegistry.h"
+#import "LGSharedSupport.h"
 #import <objc/runtime.h>
 
 #pragma mark - class / ancestry helpers
@@ -53,7 +54,8 @@ BOOL LGProcessMatchesExclusionList(id list) {
 BOOL lgHostEnabled(NSString *prefix) {
     if (!prefix.length) return YES;
     id global = LGGlassPreferenceValue(@"Global.Enabled");
-    if (![prefix isEqualToString:@"Global"] && [global isKindOfClass:[NSNumber class]] && ![global boolValue])
+    if (![prefix isEqualToString:@"Global"] &&
+        (![global isKindOfClass:[NSNumber class]] || ![global boolValue]))
         return NO;
     id v = LGGlassPreferenceValue([prefix stringByAppendingString:@".Enabled"]);
 
@@ -213,6 +215,10 @@ static void lgRouteMaterialHost(UIView *material) {
         LGRemoveGlassFromMaterial(material, kGlassKey);
         return;
     }
+    if (LGMaterialHasGlass(material, kGlassKey)) {
+        LGResyncGlassGeometry(material, kGlassKey);
+        return;
+    }
     for (LGMaterialHostRoute *route in sMaterialHostRoutes) {
         if (!route.matcher(material)) continue;
         CGFloat radius = route.cornerRadiusProvider
@@ -249,6 +255,7 @@ static void lgEnablePrefsReloadCallback(CFNotificationCenterRef c, void *o, CFSt
     LGInvalidateGlassPreferenceCache();
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        LGReloadPreferences();
         lgReconcileInjectionsForDisable();
         LGLog(@"prefs Reload reconciled material hosts; extraHandlers=%lu",
               (unsigned long)sReloadHandlers.count);
