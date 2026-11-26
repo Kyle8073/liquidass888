@@ -3,9 +3,6 @@
 #import "../Shared/LGLiveBackdropView.h"
 #import "../Shared/LGSharedSupport.h"
 #import "../Shared/LGFramework.h"
-#if !TARGET_OS_SIMULATOR
-#import <AltList/ATLApplicationListMultiSelectionController.h>
-#endif
 #import <Preferences/PSSpecifier.h>
 #import <notify.h>
 #import <objc/message.h>
@@ -40,8 +37,12 @@ static void *kLGObserverCleanupKey = &kLGObserverCleanupKey;
 @implementation LGHelperDisplayLinkProxy
 - (void)tick:(CADisplayLink *)link {
     id t = self.target;
-    if (t) [t performSelector:@selector(tick:) withObject:link];
-    else [link invalidate];
+    SEL sel = NSSelectorFromString(@"tick:");
+    if (t && [t respondsToSelector:sel]) {
+        ((void (*)(id, SEL, CADisplayLink *))objc_msgSend)(t, sel, link);
+    } else if (!t) {
+        [link invalidate];
+    }
 }
 @end
 
@@ -1362,7 +1363,10 @@ UIView *LGMakeDonationRow(UIViewController *controller,
     button.translatesAutoresizingMaskIntoConstraints = NO;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentFill;
     button.contentVerticalAlignment = UIControlContentVerticalAlignmentFill;
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     button.contentEdgeInsets = UIEdgeInsetsZero;
+    #pragma clang diagnostic pop
     __weak UIViewController *weakController = controller;
     [button addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
         (void)action;
@@ -1620,9 +1624,30 @@ static void LGPresentAppList(UIViewController *controller, NSString *key,
     [specifier setProperty:@YES forKey:@"includeIdentifiersInSearch"];
     [specifier setProperty:@YES forKey:@"showIdentifiersAsSubtitle"];
 
-    ATLApplicationListMultiSelectionController *list =
-        [ATLApplicationListMultiSelectionController new];
-    [list setSpecifier:specifier];
+    Class altListClass = NSClassFromString(@"ATLApplicationListMultiSelectionController");
+    if (!altListClass) {
+        NSArray<NSString *> *frameworkPaths = @[
+            jbroot(@"/Library/Frameworks/AltList.framework"),
+            @"/var/jb/Library/Frameworks/AltList.framework",
+            @"/Library/Frameworks/AltList.framework",
+        ];
+        for (NSString *path in frameworkPaths) {
+            NSBundle *bundle = [NSBundle bundleWithPath:path];
+            if (bundle && [bundle load]) {
+                altListClass = NSClassFromString(@"ATLApplicationListMultiSelectionController");
+                if (altListClass) break;
+            }
+        }
+    }
+    if (!altListClass) {
+        LGPresentInfoSheet(controller, title, @"AltList is not installed.");
+        return;
+    }
+    UIViewController *list = (UIViewController *)[[altListClass alloc] init];
+    SEL setSpecifierSel = NSSelectorFromString(@"setSpecifier:");
+    if ([list respondsToSelector:setSpecifierSel]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(list, setSpecifierSel, specifier);
+    }
     list.title = title;
     [controller.navigationController pushViewController:list animated:YES];
 #endif
