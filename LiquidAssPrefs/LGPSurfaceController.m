@@ -440,7 +440,8 @@ static void LGRestartAssistiveTouchDaemon(void) {
 - (void)handlePrefsUIRefresh:(NSNotification *)notification {
     (void)notification;
     if (!self.isViewLoaded) return;
-    [self animateVisibleControlsToDefaults];
+    [self reloadVisibleSettings];
+    [self updateRespringBarAnimated:YES];
 }
 
 - (void)handleRespringStateChanged:(NSNotification *)notification {
@@ -1108,8 +1109,11 @@ static void LGRestartAssistiveTouchDaemon(void) {
     toggle.on = [LGReadPreference(item[@"key"], item[@"default"]) boolValue];
     objc_setAssociatedObject(toggle, kLGDefaultValueKey, item[@"default"], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(toggle, kLGPreferenceKeyKey, item[@"key"], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    __weak typeof(self) weakSelf = self;
     [toggle addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
         UISwitch *sender = (UISwitch *)action.sender;
+        LGPSurfaceController *strongSelf = weakSelf;
+        if (!strongSelf) return;
         if ([item[@"key"] isEqualToString:@"AppIcons.Enabled"] && sender.isOn) {
             __weak UISwitch *weakSender = sender;
             UIAlertController *alert = [UIAlertController
@@ -1127,28 +1131,29 @@ static void LGRestartAssistiveTouchDaemon(void) {
                           style:UIAlertActionStyleDefault
                         handler:^(__unused UIAlertAction *alertAction) {
                             UISwitch *confirmedSender = weakSender;
+                            LGPSurfaceController *confirmedSelf = weakSelf;
                             if (!confirmedSender) return;
                             [confirmedSender setOn:YES animated:YES];
                             LGWritePreferenceAndMaybeRequireRespring(item[@"key"], @YES);
-                            [self handleRespringStateChanged:nil];
+                            [confirmedSelf handleRespringStateChanged:nil];
                             if ([item[@"controls_following_panel"] boolValue]) {
-                                [self updatePanelsControlledByEnabledKey:item[@"key"]
-                                                                 enabled:YES
-                                                                animated:YES];
+                                [confirmedSelf updatePanelsControlledByEnabledKey:item[@"key"]
+                                                                          enabled:YES
+                                                                         animated:YES];
                             }
                         }]];
-            [self presentViewController:alert animated:YES completion:nil];
+            [strongSelf presentViewController:alert animated:YES completion:nil];
             return;
         }
         if ([item[@"key"] isEqualToString:@"SettingsControls.Enabled"]) {
             LGWritePreference(item[@"key"], @(sender.isOn));
-            LGPresentReopenSettingsConfirmation(self);
+            LGPresentReopenSettingsConfirmation(strongSelf);
         } else if ([item[@"key"] hasPrefix:@"Preferences."]) {
             LGWritePreference(item[@"key"], @(sender.isOn));
-            [self configureCustomBackButton];
-            [self updateScrollTopButtonAnimated:YES];
-            [self refreshScrollTopButtonBackdrop];
-            LGRefreshRespringBarGlass(_respringBar);
+            [strongSelf configureCustomBackButton];
+            [strongSelf updateScrollTopButtonAnimated:YES];
+            [strongSelf refreshScrollTopButtonBackdrop];
+            LGRefreshRespringBarGlass(strongSelf->_respringBar);
         } else if ([item[@"key"] hasPrefix:@"Specular.Motion."] || [item[@"key"] hasSuffix:@".SpecularEnabled"]) {
             LGWritePreference(item[@"key"], @(sender.isOn));
             CFPreferencesSetAppValue((__bridge CFStringRef)item[@"key"],
@@ -1158,10 +1163,10 @@ static void LGRestartAssistiveTouchDaemon(void) {
             notify_post(LGPrefsChangedNotificationCString);
         } else {
             LGWritePreferenceAndMaybeRequireRespring(item[@"key"], @(sender.isOn));
-            [self handleRespringStateChanged:nil];
+            [strongSelf handleRespringStateChanged:nil];
         }
         if ([item[@"controls_following_panel"] boolValue]) {
-            [self updatePanelsControlledByEnabledKey:item[@"key"] enabled:sender.isOn animated:YES];
+            [strongSelf updatePanelsControlledByEnabledKey:item[@"key"] enabled:sender.isOn animated:YES];
         }
     }] forControlEvents:UIControlEventValueChanged];
     objc_setAssociatedObject(toggle, kLGControlledByEnabledKey, item[@"controls_following_panel"], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1528,7 +1533,7 @@ static void LGRestartAssistiveTouchDaemon(void) {
     objc_setAssociatedObject(valueLabel, kLGPreferenceKeyKey, preferenceKey, OBJC_ASSOCIATION_COPY_NONATOMIC);
     objc_setAssociatedObject(valueLabel, kLGDefaultValueKey, fallback, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.forward"]];
     chevron.tintColor = [UIColor tertiaryLabelColor];
     chevron.contentMode = UIViewContentModeScaleAspectFit;
     [chevron.widthAnchor constraintEqualToConstant:12.0].active = YES;
@@ -1615,7 +1620,7 @@ static void LGRestartAssistiveTouchDaemon(void) {
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     [body addSubview:stack];
 
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.forward"]];
     chevron.tintColor = [UIColor tertiaryLabelColor];
     chevron.contentMode = UIViewContentModeScaleAspectFit;
     [chevron.widthAnchor constraintEqualToConstant:12.0].active = YES;

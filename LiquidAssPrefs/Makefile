@@ -26,6 +26,10 @@ LiquidAssPrefs_RESOURCE_FILES = ../changelogs
 include $(THEOS_MAKE_PATH)/bundle.mk
 
 after-stage::
-	mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences
-	cp Resources/entry.plist $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/LiquidAssPrefs.plist
-	ldid -S $(THEOS_STAGING_DIR)/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs
+	mkdir -p "$(THEOS_STAGING_DIR)$(THEOS_PACKAGE_PREFIX)/Library/PreferenceLoader/Preferences"
+	cp Resources/entry.plist "$(THEOS_STAGING_DIR)$(THEOS_PACKAGE_PREFIX)/Library/PreferenceLoader/Preferences/LiquidAssPrefs.plist"
+	if [ -f "$(THEOS_STAGING_DIR)$(THEOS_PACKAGE_PREFIX)/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs" ]; then \
+		ldid -S "$(THEOS_STAGING_DIR)$(THEOS_PACKAGE_PREFIX)/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs"; \
+	elif [ -f "$(THEOS_STAGING_DIR)/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs" ]; then \
+		ldid -S "$(THEOS_STAGING_DIR)/Library/PreferenceBundles/LiquidAssPrefs.bundle/LiquidAssPrefs"; \
+	fi
