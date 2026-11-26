@@ -19,8 +19,42 @@ static void *kLGAlertDescriptionBaseFontKey = &kLGAlertDescriptionBaseFontKey;
 static void *kLGAlertActionLogSignatureKey = &kLGAlertActionLogSignatureKey;
 static void *kLGAlertHierarchyProbeKey = &kLGAlertHierarchyProbeKey;
 
+extern BOOL LGDebugLoggingEnabled(void);
+static NSHashTable<UIAlertController *> *sLGTrackedAlertControllers;
+
 static BOOL LGAlertsEnabled(void) {
     return lgHostEnabled(@"Alerts");
+}
+
+static BOOL LGAlertIsRTL(UIView *view) {
+    if (@available(iOS 9.0, *)) {
+        if (view && view.effectiveUserInterfaceLayoutDirection == UIUserInterfaceLayoutDirectionRightToLeft)
+            return YES;
+        if ([UIView userInterfaceLayoutDirectionForSemanticContentAttribute:
+                view ? view.semanticContentAttribute : UISemanticContentAttributeUnspecified] == UIUserInterfaceLayoutDirectionRightToLeft)
+            return YES;
+    }
+    return [UIApplication sharedApplication].userInterfaceLayoutDirection == UIUserInterfaceLayoutDirectionRightToLeft;
+}
+
+static UIView *LGAlertChromeAncestor(UIView *view) {
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+        NSString *cls = NSStringFromClass(ancestor.class);
+        if ([cls hasPrefix:@"_UIAlertControllerPhoneTVMacView"] ||
+            [cls isEqualToString:@"_UIAlertControllerView"] ||
+            [cls isEqualToString:@"_UIAlertControllerInterfaceActionGroupView"])
+            return ancestor;
+    }
+    return nil;
+}
+
+static BOOL LGAlertViewHasTextField(UIView *root) {
+    if (!root) return NO;
+    if ([root isKindOfClass:UITextField.class]) return YES;
+    for (UIView *subview in root.subviews) {
+        if (LGAlertViewHasTextField(subview)) return YES;
+    }
+    return NO;
 }
 
 static BOOL LGAlertViewUsesAlertStyle(UIView *view) {
@@ -120,7 +154,7 @@ static void LGAlertRestoreStockBackdrops(UIAlertController *controller) {
         view.alpha = [state[@"alpha"] doubleValue];
     }
     objc_setAssociatedObject(controller, kLGAlertSuppressedViewsKey, nil,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void LGAlertRemoveNativeGlass(UIAlertController *controller) {
@@ -128,11 +162,15 @@ static void LGAlertRemoveNativeGlass(UIAlertController *controller) {
         objc_getAssociatedObject(controller, kLGAlertGlassKey);
     [glass removeFromSuperview];
     objc_setAssociatedObject(controller, kLGAlertGlassKey, nil,
-                             OBJC_ASSOCIATION_ASSIGN);
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     LGAlertRestoreStockBackdrops(controller);
 }
 
 static void LGAlertInstallNativeGlass(UIAlertController *controller) {
+    if (!sLGTrackedAlertControllers)
+        sLGTrackedAlertControllers = [NSHashTable weakObjectsHashTable];
+    [sLGTrackedAlertControllers addObject:controller];
+
     if (!LGAlertsEnabled() ||
         controller.preferredStyle != UIAlertControllerStyleAlert) {
         LGAlertRemoveNativeGlass(controller);
@@ -144,6 +182,7 @@ static void LGAlertInstallNativeGlass(UIAlertController *controller) {
 
     LGLiveBackdropView *glass =
         objc_getAssociatedObject(controller, kLGAlertGlassKey);
+    BOOL fresh = (glass == nil);
     if (!glass) {
         glass = LGCreateRegisteredGlass(chrome.bounds, nil, @"Alerts");
         if (!glass) return;
@@ -154,11 +193,14 @@ static void LGAlertInstallNativeGlass(UIAlertController *controller) {
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (glass.superview != chrome) [chrome insertSubview:glass atIndex:0];
-    glass.frame = chrome.bounds;
-    glass.layer.cornerRadius = 35.0;
-    if (@available(iOS 13.0, *)) glass.layer.cornerCurve = kCACornerCurveContinuous;
-    glass.layer.masksToBounds = YES;
-    [glass applyFilters];
+    if (!CGRectEqualToRect(glass.frame, chrome.bounds)) glass.frame = chrome.bounds;
+    if (fabs(glass.layer.cornerRadius - 35.0) > 0.01) glass.layer.cornerRadius = 35.0;
+    if (@available(iOS 13.0, *)) {
+        if (glass.layer.cornerCurve != kCACornerCurveContinuous)
+            glass.layer.cornerCurve = kCACornerCurveContinuous;
+    }
+    if (!glass.layer.masksToBounds) glass.layer.masksToBounds = YES;
+    if (fresh || !glass.lgFilterAttached) [glass applyFilters];
 
     LGAlertSuppressStockBackdrops(controller, chrome);
 }
@@ -250,9 +292,10 @@ static void LGAlertStyleActionLabels(UIView *root, UIView *representation) {
             }
             label.font = [UIFont systemFontOfSize:MAX(1.0,
                 baseFont.pointSize - 1.5) weight:UIFontWeightSemibold];
-            label.numberOfLines = 1;
+            label.numberOfLines = 2;
             label.lineBreakMode = NSLineBreakByTruncatingTail;
-            label.adjustsFontSizeToFitWidth = NO;
+            label.adjustsFontSizeToFitWidth = YES;
+            label.minimumScaleFactor = 0.78;
             label.layer.filters = nil;
             label.layer.compositingFilter = nil;
             if (!objc_getAssociatedObject(label, kLGAlertActionLabelWidthKey)) {
@@ -343,15 +386,34 @@ static void LGAlertScheduleHeaderStyle(UIView *headerScrollView) {
 
 static void LGAlertStyleHeaderLabels(UIView *headerScrollView) {
     if (!LGAlertsEnabled() || !LGAlertViewUsesAlertStyle(headerScrollView)) return;
+    UIView *alertRoot = LGAlertChromeAncestor(headerScrollView);
+    if (LGAlertViewHasTextField(alertRoot ?: headerScrollView.window)) {
+        for (UIView *child in headerScrollView.subviews) {
+            for (UIView *grandchild in child.subviews) {
+                if (![grandchild isKindOfClass:UILabel.class]) continue;
+                grandchild.transform = CGAffineTransformIdentity;
+                objc_setAssociatedObject(grandchild, kLGAlertHeaderRightInsetKey,
+                                         nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        return;
+    }
+
+    const BOOL isRTL = LGAlertIsRTL(headerScrollView);
+    const NSTextAlignment alignment = isRTL ? NSTextAlignmentRight : NSTextAlignmentLeft;
+    const CGFloat shiftX = isRTL ? -7.5 : 7.5;
+    NSNumber *insetDirection = @(isRTL ? -1 : 1);
+    const BOOL debug = LGDebugLoggingEnabled();
+
     for (UIView *child in headerScrollView.subviews) {
         NSMutableArray<UILabel *> *labels = [NSMutableArray array];
         for (UIView *grandchild in child.subviews) {
             if (![grandchild isKindOfClass:UILabel.class]) continue;
             UILabel *label = (UILabel *)grandchild;
             label.transform = CGAffineTransformIdentity;
-            label.textAlignment = NSTextAlignmentLeft;
+            label.textAlignment = alignment;
             objc_setAssociatedObject(label, kLGAlertHeaderRightInsetKey,
-                                     @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                                     insetDirection, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [labels addObject:label];
         }
         [labels sortUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
@@ -383,8 +445,9 @@ static void LGAlertStyleHeaderLabels(UIView *headerScrollView) {
                 CGFloat titleBottom = CGRectGetMaxY([title convertRect:title.bounds
                                                                toView:window]);
                 CGFloat actionTop = CGFLOAT_MAX;
-                NSMutableArray<NSString *> *actionDiagnostics = [NSMutableArray array];
-                LGAlertFindNearestActionBelowY(window, window, titleBottom, &actionTop,
+                NSMutableArray<NSString *> *actionDiagnostics = debug ? [NSMutableArray array] : nil;
+                LGAlertFindNearestActionBelowY(alertRoot ?: window, window,
+                                               titleBottom, &actionTop,
                                                actionDiagnostics);
                 CGFloat shiftY = 0.0;
                 if (actionTop < CGFLOAT_MAX) {
@@ -400,35 +463,37 @@ static void LGAlertStyleHeaderLabels(UIView *headerScrollView) {
                     targetCenter = MAX(minimumTop + height * 0.5,
                         MIN(targetCenter, maximumBottom - height * 0.5));
                     shiftY = targetCenter - CGRectGetMidY(description.frame);
-                    description.transform = CGAffineTransformMakeTranslation(7.5, shiftY);
+                    description.transform = CGAffineTransformMakeTranslation(shiftX, shiftY);
                 } else {
-                    description.transform = CGAffineTransformMakeTranslation(7.5, 0.0);
+                    description.transform = CGAffineTransformMakeTranslation(shiftX, 0.0);
                 }
-                NSString *signature = [NSString stringWithFormat:
-                    @"header=%p child=%p childWin=%@ title='%@' titleFrame=%@ titleWin=%@ "
-                     "description='%@' descriptionFrame=%@ descriptionWin=%@ actionTop=%.2f "
-                     "shiftY=%.2f actions=%@",
-                    headerScrollView, child,
-                    NSStringFromCGRect([child convertRect:child.bounds toView:window]),
-                    title.text, NSStringFromCGRect(title.frame),
-                    NSStringFromCGRect([title convertRect:title.bounds toView:window]),
-                    description.text, NSStringFromCGRect(description.frame),
-                    NSStringFromCGRect([description convertRect:description.bounds toView:window]),
-                    actionTop, shiftY, actionDiagnostics];
-                NSString *previous = objc_getAssociatedObject(headerScrollView,
-                    kLGAlertHeaderLogSignatureKey);
-                if (![previous isEqualToString:signature]) {
-                    LGLog(@"[alert-layout] %@", signature);
-                    objc_setAssociatedObject(headerScrollView,
-                        kLGAlertHeaderLogSignatureKey, signature,
-                        OBJC_ASSOCIATION_COPY_NONATOMIC);
+                if (debug) {
+                    NSString *signature = [NSString stringWithFormat:
+                        @"header=%p child=%p childWin=%@ title='%@' titleFrame=%@ titleWin=%@ "
+                         "description='%@' descriptionFrame=%@ descriptionWin=%@ actionTop=%.2f "
+                         "shiftY=%.2f actions=%@",
+                        headerScrollView, child,
+                        NSStringFromCGRect([child convertRect:child.bounds toView:window]),
+                        title.text, NSStringFromCGRect(title.frame),
+                        NSStringFromCGRect([title convertRect:title.bounds toView:window]),
+                        description.text, NSStringFromCGRect(description.frame),
+                        NSStringFromCGRect([description convertRect:description.bounds toView:window]),
+                        actionTop, shiftY, actionDiagnostics];
+                    NSString *previous = objc_getAssociatedObject(headerScrollView,
+                        kLGAlertHeaderLogSignatureKey);
+                    if (![previous isEqualToString:signature]) {
+                        LGLog(@"[alert-layout] %@", signature);
+                        objc_setAssociatedObject(headerScrollView,
+                            kLGAlertHeaderLogSignatureKey, signature,
+                            OBJC_ASSOCIATION_COPY_NONATOMIC);
+                    }
                 }
             } else {
-                description.transform = CGAffineTransformMakeTranslation(7.5, 0.0);
+                description.transform = CGAffineTransformMakeTranslation(shiftX, 0.0);
             }
         }
         if (labels.count > 0)
-            labels.firstObject.transform = CGAffineTransformMakeTranslation(7.5, 0.0);
+            labels.firstObject.transform = CGAffineTransformMakeTranslation(shiftX, 0.0);
     }
 }
 
@@ -490,46 +555,51 @@ static void LGAlertStyleActionRepresentation(UIView *representation) {
         leftInset = slotMinX <= 1.0 ? 16.0 : 0.0;
         rightInset = slotMaxX >= containerWidth - 1.0 ? 16.0 : 0.0;
     }
-    background.frame = CGRectMake(leftInset, 0.0,
+    CGRect bgFrame = CGRectMake(leftInset, 0.0,
         MAX(0.0, CGRectGetWidth(representation.bounds) - leftInset - rightInset),
         48.0);
-    background.layer.cornerRadius = CGRectGetHeight(background.bounds) * 0.5;
-    background.layer.masksToBounds = YES;
+    if (!CGRectEqualToRect(background.frame, bgFrame)) {
+        background.frame = bgFrame;
+        background.layer.cornerRadius = CGRectGetHeight(background.bounds) * 0.5;
+    }
+    if (!background.layer.masksToBounds) background.layer.masksToBounds = YES;
     BOOL highlighted = [objc_getAssociatedObject(representation,
                                                   kLGAlertActionHighlightedKey) boolValue];
     background.alpha = 1.0;
     background.backgroundColor = LGAlertActionBackgroundColor(representation,
                                                                highlighted);
-    NSMutableArray<NSString *> *ancestry = [NSMutableArray array];
-    for (UIView *ancestor = representation; ancestor; ancestor = ancestor.superview) {
-        CGRect windowFrame = ancestor.window
-            ? [ancestor convertRect:ancestor.bounds toView:ancestor.window]
-            : CGRectZero;
-        NSString *extra = [ancestor isKindOfClass:UIStackView.class]
-            ? [NSString stringWithFormat:@" axis=%ld arranged=%lu spacing=%.2f margins=%@",
-                (long)((UIStackView *)ancestor).axis,
-                (unsigned long)((UIStackView *)ancestor).arrangedSubviews.count,
-                ((UIStackView *)ancestor).spacing,
-                NSStringFromUIEdgeInsets(((UIStackView *)ancestor).layoutMargins)]
-            : @"";
-        [ancestry addObject:[NSString stringWithFormat:
-            @"%@:%p bounds=%@ window=%@%@",
-            NSStringFromClass(ancestor.class), ancestor,
-            NSStringFromCGRect(ancestor.bounds), NSStringFromCGRect(windowFrame),
-            extra]];
-        if ([NSStringFromClass(ancestor.class)
-                hasPrefix:@"_UIAlertControllerPhoneTVMacView"]) break;
-    }
-    NSString *signature = [NSString stringWithFormat:
-        @"representation=%p horizontal=%d result=%@ ancestry=%@",
-        representation, horizontalPair, NSStringFromCGRect(background.frame),
-        ancestry];
-    NSString *previous = objc_getAssociatedObject(representation,
-                                                   kLGAlertActionLogSignatureKey);
-    if (![previous isEqualToString:signature]) {
-        LGLog(@"[alert-action-layout] %@", signature);
-        objc_setAssociatedObject(representation, kLGAlertActionLogSignatureKey,
-                                 signature, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    if (LGDebugLoggingEnabled()) {
+        NSMutableArray<NSString *> *ancestry = [NSMutableArray array];
+        for (UIView *ancestor = representation; ancestor; ancestor = ancestor.superview) {
+            CGRect windowFrame = ancestor.window
+                ? [ancestor convertRect:ancestor.bounds toView:ancestor.window]
+                : CGRectZero;
+            NSString *extra = [ancestor isKindOfClass:UIStackView.class]
+                ? [NSString stringWithFormat:@" axis=%ld arranged=%lu spacing=%.2f margins=%@",
+                    (long)((UIStackView *)ancestor).axis,
+                    (unsigned long)((UIStackView *)ancestor).arrangedSubviews.count,
+                    ((UIStackView *)ancestor).spacing,
+                    NSStringFromUIEdgeInsets(((UIStackView *)ancestor).layoutMargins)]
+                : @"";
+            [ancestry addObject:[NSString stringWithFormat:
+                @"%@:%p bounds=%@ window=%@%@",
+                NSStringFromClass(ancestor.class), ancestor,
+                NSStringFromCGRect(ancestor.bounds), NSStringFromCGRect(windowFrame),
+                extra]];
+            if ([NSStringFromClass(ancestor.class)
+                    hasPrefix:@"_UIAlertControllerPhoneTVMacView"]) break;
+        }
+        NSString *signature = [NSString stringWithFormat:
+            @"representation=%p horizontal=%d result=%@ ancestry=%@",
+            representation, horizontalPair, NSStringFromCGRect(background.frame),
+            ancestry];
+        NSString *previous = objc_getAssociatedObject(representation,
+                                                       kLGAlertActionLogSignatureKey);
+        if (![previous isEqualToString:signature]) {
+            LGLog(@"[alert-action-layout] %@", signature);
+            objc_setAssociatedObject(representation, kLGAlertActionLogSignatureKey,
+                                     signature, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
     }
     representation.tintAdjustmentMode = UIViewTintAdjustmentModeNormal;
     LGAlertSuppressNativeActionHighlight(representation);
@@ -618,7 +688,7 @@ static void LGAlertAppendViewHierarchy(UIView *view, UIWindow *referenceWindow,
 }
 
 static void LGAlertProbeHierarchy(UIAlertController *controller, NSString *reason) {
-    if (!controller) return;
+    if (!LGDebugLoggingEnabled() || !controller) return;
     if ([objc_getAssociatedObject(controller, kLGAlertHierarchyProbeKey) boolValue] &&
         ![reason isEqualToString:@"appear"]) return;
     objc_setAssociatedObject(controller, kLGAlertHierarchyProbeKey, @YES,
@@ -672,14 +742,26 @@ static void LGAlertProbeHierarchy(UIAlertController *controller, NSString *reaso
 
 - (CGRect)textRectForBounds:(CGRect)bounds
      limitedToNumberOfLines:(NSInteger)numberOfLines {
-    if ([objc_getAssociatedObject(self, kLGAlertHeaderRightInsetKey) boolValue])
+    NSInteger dir = [objc_getAssociatedObject(self, kLGAlertHeaderRightInsetKey) integerValue];
+    if (dir > 0) {
         bounds.size.width = MAX(0.0, bounds.size.width - 7.5);
+    } else if (dir < 0) {
+        CGFloat inset = MIN(7.5, bounds.size.width);
+        bounds.origin.x += inset;
+        bounds.size.width = MAX(0.0, bounds.size.width - inset);
+    }
     return %orig(bounds, numberOfLines);
 }
 
 - (void)drawTextInRect:(CGRect)rect {
-    if ([objc_getAssociatedObject(self, kLGAlertHeaderRightInsetKey) boolValue])
+    NSInteger dir = [objc_getAssociatedObject(self, kLGAlertHeaderRightInsetKey) integerValue];
+    if (dir > 0) {
         rect.size.width = MAX(0.0, rect.size.width - 7.5);
+    } else if (dir < 0) {
+        CGFloat inset = MIN(7.5, rect.size.width);
+        rect.origin.x += inset;
+        rect.size.width = MAX(0.0, rect.size.width - inset);
+    }
     %orig(rect);
 }
 
@@ -857,4 +939,11 @@ static void LGAlertProbeHierarchy(UIAlertController *controller, NSString *reaso
 %ctor {
     if (!LGIsSpringBoardProcess() && !LGIsPreferencesProcess()) return;
     %init(LGAlertsSpringBoard);
+    lgObservePreferenceReload(^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIAlertController *controller in [sLGTrackedAlertControllers allObjects]) {
+                LGAlertInstallNativeGlass(controller);
+            }
+        });
+    });
 }

@@ -3,15 +3,24 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "../Shared/LGLiveBackdropView.h"
+#import "../Shared/LGGlassKit.h"
 #import "../Shared/LGSharedSupport.h"
 
 #import "../Shared/LGFramework.h"
 
+static BOOL LGAssistiveTouchEnabled(void) {
+    return lgHostEnabled(@"AssistiveTouch");
+}
+
 static UIImage *CreateExposureGlowImage(CGFloat diameter) {
+    if (diameter <= 0.5 || !isfinite(diameter)) return nil;
     CGSize size = CGSizeMake(diameter, diameter);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return nil;
+    if (!ctx) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     NSArray *colors = @[
@@ -53,7 +62,7 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
         self.clipsToBounds = NO;
         self.alpha = 0.0;
 
-        CGFloat radius = frame.size.height / 2.0;
+        CGFloat radius = MIN(frame.size.width, frame.size.height) / 2.0;
 
         self.backgroundContainer = [[UIView alloc] initWithFrame:self.bounds];
         self.backgroundContainer.center = CGPointMake(frame.size.width / 2.0, frame.size.height / 2.0);
@@ -85,17 +94,21 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
         self.darkTintView.layer.cornerCurve = kCACornerCurveContinuous;
         [self.backgroundContainer addSubview:self.darkTintView];
 
-        CGFloat glowSize = frame.size.width * 1.55;
+        CGFloat glowSize = MAX(frame.size.width, frame.size.height) * 1.55;
         self.exposureGlowView = [[UIImageView alloc] initWithImage:CreateExposureGlowImage(glowSize)];
         self.exposureGlowView.frame = CGRectMake(0, 0, glowSize, glowSize);
         self.exposureGlowView.center = CGPointMake(self.backgroundContainer.bounds.size.width / 2.0, self.backgroundContainer.bounds.size.height / 2.0);
         self.exposureGlowView.alpha = 0.0;
         [self.backgroundContainer addSubview:self.exposureGlowView];
 
-        for (NSNumber *delay in @[@0.5, @1.5, @3.0, @5.0]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self.lgView applyFilters];
-                [self.lgView lgInvalidateFilterContents];
+        if (!self.lgView.lgFilterAttached) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                ASSHeldGlassView *strongSelf = weakSelf;
+                if (strongSelf && strongSelf.window && !strongSelf.lgView.lgFilterAttached) {
+                    [strongSelf.lgView applyFilters];
+                    [strongSelf.lgView lgInvalidateFilterContents];
+                }
             });
         }
     }
@@ -104,13 +117,18 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
 
 - (void)updateShapeForBounds:(CGRect)bounds {
     self.frame = bounds;
+    if (bounds.size.width > 0.5 && bounds.size.height > 0.5 && !self.exposureGlowView.image) {
+        CGFloat glowSize = MAX(bounds.size.width, bounds.size.height) * 1.55;
+        self.exposureGlowView.image = CreateExposureGlowImage(glowSize);
+        self.exposureGlowView.bounds = CGRectMake(0, 0, glowSize, glowSize);
+    }
     [self updateShapeWithScale:1.0 stretchX:1.0 stretchY:1.0 shiftX:0 shiftY:0];
 }
 
 - (void)updateShapeWithScale:(CGFloat)baseScale stretchX:(CGFloat)stretchX stretchY:(CGFloat)stretchY shiftX:(CGFloat)shiftX shiftY:(CGFloat)shiftY {
     CGFloat newW = self.bounds.size.width * baseScale * stretchX;
     CGFloat newH = self.bounds.size.height * baseScale * stretchY;
-    CGFloat newRadius = newH / 2.0;
+    CGFloat newRadius = MIN(newW, newH) / 2.0;
 
     CGRect newBounds = CGRectMake(0, 0, newW, newH);
     CGPoint center = CGPointMake(self.bounds.size.width / 2.0 + shiftX, self.bounds.size.height / 2.0 + shiftY);
@@ -180,7 +198,8 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
     @try {
         [layer setValue:@NO forKey:@"layerUsesCoreImageFilters"];
         [layer setValue:@YES forKey:@"windowServerAware"];
-        [layer setValue:@(1.0) forKey:@"scale"];
+        [layer setValue:@(0.5) forKey:@"scale"];
+        if (layer.filters.count > 0) return;
 
         Class filterCls = NSClassFromString(@"CAFilter");
         if (!filterCls) return;
@@ -223,7 +242,7 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
     CGFloat baseH = (superH > 0) ? superH : 60.0;
     CGFloat newW = baseW * baseScale * stretchX;
     CGFloat newH = baseH * baseScale * stretchY;
-    CGFloat newRadius = newH / 2.0;
+    CGFloat newRadius = MIN(newW, newH) / 2.0;
 
     CGRect newBounds = CGRectMake(0, 0, newW, newH);
     CGPoint center = CGPointMake(baseW / 2.0 + shiftX, baseH / 2.0 + shiftY);
@@ -238,10 +257,14 @@ static UIImage *CreateExposureGlowImage(CGFloat diameter) {
 @end
 
 static UIImage *CreateRadialGlowImage(CGFloat diameter) {
+    if (diameter <= 0.5 || !isfinite(diameter)) return nil;
     CGSize size = CGSizeMake(diameter, diameter);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return nil;
+    if (!ctx) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     NSArray *colors = @[(id)[UIColor colorWithWhite:1.0 alpha:0.40].CGColor,
@@ -380,11 +403,60 @@ static const void *kAssVibranceViewKey = &kAssVibranceViewKey;
 static const void *kAssMenuGlowViewKey = &kAssMenuGlowViewKey;
 static const void *kAssIsHeldKey = &kAssIsHeldKey;
 static const void *kAssStartPointKey = &kAssStartPointKey;
+static const void *kAssBackdropAlphaKey = &kAssBackdropAlphaKey;
+static const void *kAssMotionBlurGenKey = &kAssMotionBlurGenKey;
 static __weak HNDRocker *sCurrentActiveRocker = nil;
+
+static void LGAssistiveTouchTeardownRocker(HNDRocker *rocker) {
+    if (!rocker) return;
+    objc_setAssociatedObject(rocker, kAssIsHeldKey, @(NO), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ASSHeldGlassView *glass = [rocker ass_glassView];
+    if (glass) {
+        [glass.layer removeAllAnimations];
+        glass.alpha = 0.0;
+        glass.hidden = YES;
+        glass.exposureGlowView.alpha = 0.0;
+    }
+    ASSVibranceOverlayView *vibe = [rocker ass_vibranceView];
+    if (vibe) {
+        [vibe.layer removeAllAnimations];
+        vibe.alpha = 0.0;
+        vibe.hidden = YES;
+    }
+    ASSMenuInnerGlowView *menuGlow = [rocker ass_menuGlowView];
+    if (menuGlow) {
+        [menuGlow resetGlowImmediately];
+    }
+    UIVisualEffectView *backdrop = [rocker ass_backdropView];
+    NSNumber *savedAlpha = objc_getAssociatedObject(rocker, kAssBackdropAlphaKey);
+    if (backdrop && savedAlpha) {
+        backdrop.alpha = savedAlpha.doubleValue;
+    }
+    objc_setAssociatedObject(rocker, kAssBackdropAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    UIImageView *fg = [rocker ass_nubbitForeground];
+    if (fg) {
+        [fg.layer removeAllAnimations];
+        fg.transform = CGAffineTransformIdentity;
+        fg.layer.shadowOpacity = 0.0;
+        fg.layer.filters = nil;
+    }
+    [rocker.layer removeAnimationForKey:@"ass_motionBlurAnim"];
+    NSMutableArray *filters = [rocker.layer.filters mutableCopy];
+    if (filters.count) {
+        NSMutableArray *kept = [NSMutableArray arrayWithCapacity:filters.count];
+        for (id f in filters) {
+            NSString *name = [f respondsToSelector:@selector(name)]
+                ? ((NSString *(*)(id, SEL))objc_msgSend)(f, @selector(name)) : nil;
+            if (![name isEqualToString:@"ass_motionBlur"]) [kept addObject:f];
+        }
+        rocker.layer.filters = kept.count ? kept : nil;
+    }
+}
 
 %hook HNDRocker
 
 - (BOOL)_usesCircularNubbit {
+    if (!LGAssistiveTouchEnabled()) return %orig;
     return YES;
 }
 
@@ -426,6 +498,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 %new
 - (void)ass_triggerMotionBlurForDuration:(CGFloat)duration peakRadius:(CGFloat)peak {
+    if (!LGAssistiveTouchEnabled()) return;
     Class filterCls = NSClassFromString(@"CAFilter");
     if (!filterCls) return;
 
@@ -459,6 +532,9 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
     }
 
     if (blurFilter) {
+        NSUInteger gen = [objc_getAssociatedObject(self, kAssMotionBlurGenKey) unsignedIntegerValue] + 1;
+        objc_setAssociatedObject(self, kAssMotionBlurGenKey, @(gen), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
         [layer removeAnimationForKey:@"ass_motionBlurAnim"];
 
         CAKeyframeAnimation *anim = [CAKeyframeAnimation animationWithKeyPath:@"filters.ass_motionBlur.inputRadius"];
@@ -481,64 +557,90 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
             [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut]
         ];
         anim.removedOnCompletion = YES;
+        __weak HNDRocker *weakSelf = self;
+        if (backdrop && !objc_getAssociatedObject(self, kAssBackdropAlphaKey)) {
+        objc_setAssociatedObject(self, kAssBackdropAlphaKey, @(backdrop.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    [CATransaction begin];
+        [CATransaction setCompletionBlock:^{
+            HNDRocker *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if ([objc_getAssociatedObject(strongSelf, kAssMotionBlurGenKey) unsignedIntegerValue] != gen) return;
+            NSMutableArray *curFilters = [strongSelf.layer.filters mutableCopy];
+            if (!curFilters.count) return;
+            NSMutableArray *kept = [NSMutableArray arrayWithCapacity:curFilters.count];
+            for (id f in curFilters) {
+                NSString *name = [f respondsToSelector:@selector(name)]
+                    ? ((NSString *(*)(id, SEL))objc_msgSend)(f, @selector(name)) : nil;
+                if (![name isEqualToString:@"ass_motionBlur"]) [kept addObject:f];
+            }
+            strongSelf.layer.filters = kept.count ? kept : nil;
+        }];
         [layer addAnimation:anim forKey:@"ass_motionBlurAnim"];
+        [CATransaction commit];
     }
 }
 
 - (void)_loadInitialMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadMoreMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadGesturesMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadRotateMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadScrollMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadHardwareMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadFavoritesMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadDwellMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)_loadSecureIntentMenuItems {
     %orig;
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)performPress:(int)button type:(int)type source:(int)source {
     %orig(button, type, source);
-    [self ass_playMenuBounceAnimation];
+    if (LGAssistiveTouchEnabled()) [self ass_playMenuBounceAnimation];
 }
 
 - (void)setFullMenuVisible:(BOOL)visible atPoint:(CGPoint)point {
+    if (!LGAssistiveTouchEnabled()) { %orig(visible, point); return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = visible ? 2.0f : 1.25f;
-    %orig(visible, point);
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig(visible, point);
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
     if (visible) {
         [self ass_triggerMotionBlurForDuration:0.15 peakRadius:4.5];
     } else {
@@ -553,6 +655,8 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 }
 
 - (void)_menuExited {
+    if (!LGAssistiveTouchEnabled()) { %orig; return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = 1.25f;
     [self ass_triggerMotionBlurForDuration:0.18 peakRadius:3.6];
     [[self ass_menuGlowView] resetGlowImmediately];
@@ -561,14 +665,21 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
         [backdrop.layer removeAllAnimations];
         backdrop.transform = CGAffineTransformIdentity;
     }
-    %orig;
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig;
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
 }
 
 - (void)didMoveToWindow {
     %orig;
     if (self.window) {
         sCurrentActiveRocker = self;
+        if (!LGAssistiveTouchEnabled()) {
+            LGAssistiveTouchTeardownRocker(self);
+            return;
+        }
 
         ASSHeldGlassView *glass = [self ass_glassView];
         if (!glass) {
@@ -597,6 +708,10 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)layoutSubviews {
     %orig;
+    if (!LGAssistiveTouchEnabled()) {
+        LGAssistiveTouchTeardownRocker(self);
+        return;
+    }
     if ([self isFullMenuVisible]) {
         UIVisualEffectView *backdrop = [self ass_backdropView];
         if (backdrop) {
@@ -624,6 +739,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
+    if (!LGAssistiveTouchEnabled() || [objc_getAssociatedObject(self, kAssIsHeldKey) boolValue]) return;
     ASSHeldGlassView *glass = [self ass_glassView];
     if (glass) {
         [glass updateShapeForBounds:self.bounds];
@@ -638,6 +754,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)setBounds:(CGRect)bounds {
     %orig(bounds);
+    if (!LGAssistiveTouchEnabled() || [objc_getAssociatedObject(self, kAssIsHeldKey) boolValue]) return;
     ASSHeldGlassView *glass = [self ass_glassView];
     if (glass) {
         [glass updateShapeForBounds:self.bounds];
@@ -652,6 +769,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)fadeNubbit {
     %orig;
+    if (!LGAssistiveTouchEnabled()) return;
     NSNumber *held = objc_getAssociatedObject(self, kAssIsHeldKey);
     if (![held boolValue]) {
         ASSHeldGlassView *glass = [self ass_glassView];
@@ -664,6 +782,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)_updateNubbitFadedProperties {
     %orig;
+    if (!LGAssistiveTouchEnabled()) return;
     NSNumber *held = objc_getAssociatedObject(self, kAssIsHeldKey);
     if (![held boolValue]) {
         ASSHeldGlassView *glass = [self ass_glassView];
@@ -676,6 +795,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)handleRealDownEvent:(CGPoint)point {
     %orig(point);
+    if (!LGAssistiveTouchEnabled()) return;
     if ([self isFullMenuVisible]) {
         UIVisualEffectView *backdrop = [self ass_backdropView];
         CGPoint localPt = backdrop ? [self convertPoint:point toView:backdrop.contentView] : point;
@@ -687,6 +807,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)handleRealMoveEvent:(CGPoint)point maxOrb:(double)maxOrb currentForce:(double)currentForce {
     %orig(point, maxOrb, currentForce);
+    if (!LGAssistiveTouchEnabled()) return;
     if ([self isFullMenuVisible]) {
         UIVisualEffectView *backdrop = [self ass_backdropView];
         CGPoint localPt = backdrop ? [self convertPoint:point toView:backdrop.contentView] : point;
@@ -698,6 +819,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)handleRealUpEvent:(CGPoint)point maxOrb:(double)maxOrb {
     %orig(point, maxOrb);
+    if (!LGAssistiveTouchEnabled()) return;
     if ([self isFullMenuVisible]) {
         [self ass_playMenuBounceAnimation];
         [[self ass_menuGlowView] handleTouchEnded];
@@ -708,6 +830,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)_updateSelectedButtonWithPoint:(CGPoint)point {
     %orig(point);
+    if (!LGAssistiveTouchEnabled()) return;
     if ([self isFullMenuVisible]) {
         UIVisualEffectView *backdrop = [self ass_backdropView];
         CGPoint localPt = backdrop ? [self convertPoint:point toView:backdrop.contentView] : point;
@@ -717,6 +840,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)showNubbitPressedState:(BOOL)pressed {
     %orig(pressed);
+    if (!LGAssistiveTouchEnabled()) return;
     if (![self isFullMenuVisible]) {
         if (pressed) {
             [self ass_handleTouchDownAtPoint:CGPointMake(self.bounds.size.width / 2.0, self.bounds.size.height / 2.0)];
@@ -727,6 +851,8 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 }
 
 - (void)transitionNubbitToMenu:(CGPoint)point concurrentAnimation:(id)block1 animationCompleted:(id)block2 {
+    if (!LGAssistiveTouchEnabled()) { %orig(point, block1, block2); return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = 2.0f;
     objc_setAssociatedObject(self, kAssIsHeldKey, @(NO), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -745,8 +871,11 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
         vibe.hidden = YES;
     }
 
-    %orig(point, block1, block2);
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig(point, block1, block2);
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
     [self ass_triggerMotionBlurForDuration:0.15 peakRadius:4.5];
 
     UIVisualEffectView *backdrop = [self ass_backdropView];
@@ -768,6 +897,8 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 }
 
 - (void)transitionMenuToNubbit:(CGPoint)point changeAlpha:(BOOL)changeAlpha animate:(BOOL)animate {
+    if (!LGAssistiveTouchEnabled()) { %orig(point, changeAlpha, animate); return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = 1.25f;
     objc_setAssociatedObject(self, kAssIsHeldKey, @(NO), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self ass_triggerMotionBlurForDuration:0.18 peakRadius:3.6];
@@ -796,8 +927,11 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
         fg.layer.filters = nil;
     }
 
-    %orig(point, changeAlpha, animate);
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig(point, changeAlpha, animate);
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
 
     if (vibe) {
         [vibe updateShapeForBounds:self.bounds];
@@ -881,6 +1015,10 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
     if (vibe) {
         [self bringSubviewToFront:vibe];
         [vibe forceReapplyForRegistrationRace];
+    }
+
+    if (backdrop && !objc_getAssociatedObject(self, kAssBackdropAlphaKey)) {
+        objc_setAssociatedObject(self, kAssBackdropAlphaKey, @(backdrop.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     [CATransaction begin];
@@ -1006,7 +1144,9 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
             fg.layer.filters = nil;
         }
         if (backdrop) {
-            backdrop.alpha = 0.30;
+            NSNumber *savedAlpha = objc_getAssociatedObject(self, kAssBackdropAlphaKey);
+            backdrop.alpha = savedAlpha ? savedAlpha.doubleValue : 1.0;
+            objc_setAssociatedObject(self, kAssBackdropAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
         }
     } completion:^(BOOL finished) {
         if (finished) {
@@ -1025,19 +1165,30 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 %hook HNDDisplayManager
 
 - (void)showMenu:(BOOL)arg1 {
+    if (!LGAssistiveTouchEnabled()) { %orig(arg1); return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = 2.0f;
-    %orig(arg1);
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig(arg1);
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
 }
 
 - (void)showCircleMenu:(BOOL)arg1 {
+    if (!LGAssistiveTouchEnabled()) { %orig(arg1); return; }
+    float prev = sTransitionSpeedMultiplier;
     sTransitionSpeedMultiplier = 2.0f;
-    %orig(arg1);
-    sTransitionSpeedMultiplier = 1.0f;
+    @try {
+        %orig(arg1);
+    } @finally {
+        sTransitionSpeedMultiplier = prev;
+    }
 }
 
 - (void)setNubbitMoving:(BOOL)moving {
     %orig(moving);
+    if (!LGAssistiveTouchEnabled()) return;
     HNDRocker *rocker = sCurrentActiveRocker;
     if (rocker) {
         if (moving) {
@@ -1050,6 +1201,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)_repositionNubbitAfterLift:(CGPoint)point {
     %orig(point);
+    if (!LGAssistiveTouchEnabled()) return;
     HNDRocker *rocker = sCurrentActiveRocker;
     if (rocker) {
         [rocker ass_handleTouchEnded];
@@ -1065,6 +1217,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig(highlighted);
+    if (!LGAssistiveTouchEnabled()) return;
     HNDRocker *rocker = sCurrentActiveRocker;
     if (rocker && [rocker isFullMenuVisible]) {
         if (highlighted) {
@@ -1082,6 +1235,7 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 
 - (void)performPress:(BOOL)sender {
     %orig(sender);
+    if (!LGAssistiveTouchEnabled()) return;
     HNDRocker *rocker = sCurrentActiveRocker;
     if (rocker && [rocker isFullMenuVisible]) {
         [rocker ass_playMenuBounceAnimation];
@@ -1095,16 +1249,18 @@ static __weak HNDRocker *sCurrentActiveRocker = nil;
 static void LGAssistiveTouchPrefsChanged(CFNotificationCenterRef center, void *observer,
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo) {
-    LGInvalidateGlassPreferenceCache();
-    HNDRocker *rocker = sCurrentActiveRocker;
-    if (!rocker) return;
-    id enabledVal = LGGlassPreferenceValue(@"AssistiveTouch.Enabled");
-    BOOL enabled = enabledVal ? [enabledVal boolValue] : YES;
-    ASSHeldGlassView *glass = [rocker ass_glassView];
-    if (!enabled && glass) {
-        glass.hidden = YES;
-        glass.alpha = 0.0;
-    }
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LGInvalidateGlassPreferenceCache();
+        LGReloadPreferences();
+        HNDRocker *rocker = sCurrentActiveRocker;
+        if (!rocker) return;
+        if (!LGAssistiveTouchEnabled()) {
+            LGAssistiveTouchTeardownRocker(rocker);
+        } else {
+            [rocker setNeedsLayout];
+        }
+    });
 }
 
 static void LGAssistiveTouchRestartRequested(CFNotificationCenterRef center, void *observer,
@@ -1117,9 +1273,6 @@ static void LGAssistiveTouchRestartRequested(CFNotificationCenterRef center, voi
 
 %ctor {
     if (![NSProcessInfo.processInfo.processName isEqualToString:@"assistivetouchd"]) return;
-
-    id enabledVal = LGGlassPreferenceValue(@"AssistiveTouch.Enabled");
-    if (enabledVal && ![enabledVal boolValue]) return;
 
     %init(LGAssistiveTouchHooks);
 

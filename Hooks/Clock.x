@@ -221,7 +221,7 @@ static BOOL LGClockIsLegacyHost(UIView *view) {
 }
 
 static BOOL LGClockDateFormatEnabled(void) {
-    return LG_prefBool(@"Lockscreen.Clock.DateFormat.Enabled", YES);
+    return LGClockEnabled() && LG_prefBool(@"Lockscreen.Clock.DateFormat.Enabled", YES);
 }
 
 static void *kLGClockLegacyDateOriginalFrameKey = &kLGClockLegacyDateOriginalFrameKey;
@@ -740,6 +740,9 @@ static NSString *LGClockVariableFontPath(void) {
 @property (nonatomic, copy) NSString *lastFontDiagnostic;
 @property (nonatomic) BOOL pullBlurActive;
 @property (nonatomic) BOOL pullBlurKnown;
+@property (nonatomic) CGRect lastMovementFrame;
+@property (nonatomic) NSUInteger unchangedMovementFrames;
+@property (nonatomic) CFTimeInterval lastMaskPublishTime;
 - (void)scheduleApply:(NSString *)reason;
 - (void)applyReason:(NSString *)reason;
 - (void)updatePullBlur;
@@ -753,6 +756,13 @@ static void *kLGClockLegacyNotificationPendingKey = &kLGClockLegacyNotificationP
 static void *kLGClockLegacyNotificationApplyingKey = &kLGClockLegacyNotificationApplyingKey;
 static void *kLGClockLegacyNotificationLastRelayoutKey = &kLGClockLegacyNotificationLastRelayoutKey;
 
+static NSHashTable<UIView *> *LGClockLegacyNotificationViews(void) {
+    static NSHashTable<UIView *> *views;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ views = [NSHashTable weakObjectsHashTable]; });
+    return views;
+}
+
 static CGFloat LGClockLegacyNotificationGap(void) {
     return 28.0;
 }
@@ -763,6 +773,7 @@ static BOOL LGClockLegacyShouldShiftNotifications(void) {
 
 static CGRect LGClockAdjustedLegacyNotificationFrame(UIView *listView, CGRect proposed) {
     if (!listView.window || !LGClockLegacyShouldShiftNotifications()) return proposed;
+    [LGClockLegacyNotificationViews() addObject:listView];
 
     static Class listViewClass;
     static dispatch_once_t listViewOnce;
@@ -793,6 +804,7 @@ static CGRect LGClockAdjustedLegacyNotificationFrame(UIView *listView, CGRect pr
 
 static void LGClockRelayoutLegacyNotificationList(UIView *listView) {
     if (!listView.window) return;
+    [LGClockLegacyNotificationViews() addObject:listView];
     if ([objc_getAssociatedObject(listView, kLGClockLegacyNotificationApplyingKey) boolValue]) return;
     CFTimeInterval now = CACurrentMediaTime();
     NSNumber *last = objc_getAssociatedObject(listView, kLGClockLegacyNotificationLastRelayoutKey);
@@ -857,19 +869,29 @@ static NSHashTable<LGClockState *> *LGClockStates(void) {
 }
 
 - (void)trackMotion {
+    if (!LGClockEnabled()) return;
+    for (LGClockState *state in LGClockStates().allObjects) {
+        state.unchangedMovementFrames = 0;
+    }
     self.deadline = CACurrentMediaTime() + 0.30;
     self.displayLink.preferredFramesPerSecond = LGClockFPSLimit();
     self.displayLink.paused = NO;
 }
 
 - (void)tick:(CADisplayLink *)displayLink {
+    if (!LGClockEnabled()) {
+        displayLink.paused = YES;
+        return;
+    }
     CFTimeInterval now = CACurrentMediaTime();
     BOOL settled = now >= self.deadline;
     BOOL pullActive = NO;
     for (LGClockState *state in LGClockStates().allObjects) {
-        if (!state.host.window || !state.glassView) continue;
+        if (!state.host.window || !state.glassView || state.host.hidden || state.host.alpha <= 0.01) continue;
         [state updatePullBlur];
-        pullActive |= state.pullBlurActive;
+        if (state.pullBlurActive && state.unchangedMovementFrames < 4) {
+            pullActive = YES;
+        }
         if (!state.applying)
             [state applyReason:@"motion"];
     }
@@ -953,6 +975,12 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
     CGRect frame = [container convertRect:container.bounds toView:window];
     CGRect presentationFrame = LGClockPresentationFrameInWindow(container, window);
     CGRect movementFrame = CGRectIsNull(presentationFrame) ? frame : presentationFrame;
+    if (CGRectEqualToRect(movementFrame, self.lastMovementFrame)) {
+        self.unchangedMovementFrames++;
+    } else {
+        self.lastMovementFrame = movementFrame;
+        self.unchangedMovementFrames = 0;
+    }
     BOOL active = fabs(CGRectGetMinX(movementFrame) - CGRectGetMinX(window.bounds)) > 0.5 ||
                   fabs(CGRectGetMinY(movementFrame) - CGRectGetMinY(window.bounds)) > 0.5;
     BOOL changed = !self.pullBlurKnown || active != self.pullBlurActive;
@@ -988,13 +1016,14 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
         self.originalVisibleSourceAlpha = self.visibleSourceView.alpha;
         self.originalVisibleSourceLayerOpacity = self.visibleSourceView.layer.opacity;
         self.originalVisibleSourceHidden = self.visibleSourceView.hidden;
+        UIFont *detectedFont = LGClockAttributedFont(label) ?: label.font;
         UIFont *savedFont = objc_getAssociatedObject(label, kLGClockOriginalFontKey);
-        if (!savedFont && !LGClockIsOurFont(label.font)) {
-            savedFont = label.font;
+        if (!savedFont && detectedFont && !LGClockIsOurFont(detectedFont)) {
+            savedFont = detectedFont;
             objc_setAssociatedObject(label, kLGClockOriginalFontKey,
                                      savedFont, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        self.originalFont = savedFont ?: label.font;
+        self.originalFont = savedFont ?: detectedFont;
         self.originalLabelAlpha = label.alpha;
         self.originalLabelHidden = label.hidden;
         self.originalLabelFrame = label.frame;
@@ -1031,9 +1060,10 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
                                                    &obstacleCandidates);
     CFTimeInterval profileObstacleEnd = CACurrentMediaTime();
     if (nearestTop != CGFLOAT_MAX) nearestTop = round(nearestTop);
-    NSString *signature = [NSString stringWithFormat:@"%d|%d|%@|%.2f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f",
+    NSString *signature = [NSString stringWithFormat:@"%d|%d|%@|%.2f|%.3f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f",
                            enabled, variableFontEnabled, label.text ?: label.attributedText.string,
                            self.originalFont.pointSize,
+                           variableFontEnabled ? LGClockFontScale() : 1.0,
                            variableFontEnabled ? LGClockAxisValue(@"weight") : 0.0,
                            variableFontEnabled ? LGClockAxisValue(@"width") : 0.0,
                            variableFontEnabled ? LGClockAxisValue(@"height") : 0.0,
@@ -1249,20 +1279,30 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
                         CGRectGetMinY(canvasFrame));
                 CGPathRef normalizedPath = CGPathCreateCopyByTransformingPath(glyphPath, &transform);
                 maskLayer.path = normalizedPath;
+                self.pullBlurKnown = NO;
+                [self updatePullBlur];
                 profilePrepareEnd = CACurrentMediaTime();
                 CFTimeInterval profilePublishStart = profilePrepareEnd;
-                BOOL published = LGClockPublishPath(normalizedPath, glass.bounds.size, 1.0);
-                profilePublishEnd = CACurrentMediaTime();
-                profilePublishDuration = profilePublishEnd - profilePublishStart;
-                if (!published)
-                    LGClockLog(@"mask publish failed reason=%@ text=%@ glass=%@ path=%@",
-                               reason, text, NSStringFromCGRect(glass.bounds),
-                               NSStringFromCGRect(CGPathGetBoundingBox(normalizedPath)));
-                [glass lgInvalidateFilterContents];
+                BOOL isMotion = [reason isEqualToString:@"motion"];
+                BOOL shouldPublish = !self.pullBlurActive &&
+                    (!isMotion || (profilePrepareEnd - self.lastMaskPublishTime >= 0.033));
+                if (shouldPublish) {
+                    BOOL published = LGClockPublishPath(normalizedPath, glass.bounds.size, 1.0);
+                    self.lastMaskPublishTime = profilePrepareEnd;
+                    profilePublishEnd = CACurrentMediaTime();
+                    profilePublishDuration = profilePublishEnd - profilePublishStart;
+                    if (!published)
+                        LGClockLog(@"mask publish failed reason=%@ text=%@ glass=%@ path=%@",
+                                   reason, text, NSStringFromCGRect(glass.bounds),
+                                   NSStringFromCGRect(CGPathGetBoundingBox(normalizedPath)));
+                    [glass lgInvalidateFilterContents];
+                }
                 CGPathRelease(normalizedPath);
                 CGPathRelease(glyphPath);
             }
-            glass.maskView = maskView;
+            if (!self.pullBlurActive) {
+                glass.maskView = maskView;
+            }
             [CATransaction commit];
             if (![reason isEqualToString:@"motion"])
                 [[LGClockMotionTracker shared] trackMotion];
@@ -1274,9 +1314,7 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
                 visibleSourceView.alpha = filterReady ? 0.0 : self.originalVisibleSourceAlpha;
                 visibleSourceView.layer.opacity = filterReady ? 0.0 : self.originalVisibleSourceLayerOpacity;
             }
-            self.pullBlurKnown = NO;
-            [self updatePullBlur];
-            [renderContainer bringSubviewToFront:glass];
+            [renderContainer bringSubviewToFront:self.pullBlurActive ? self.pullBlurView : glass];
             if (LGDebugLoggingEnabled()) {
             CGRect glassWindowFrame = glass.window
                 ? [glass convertRect:glass.bounds toView:glass.window] : CGRectNull;
@@ -1340,6 +1378,7 @@ static UIColor *LGClockPullTint(UITraitCollection *traits) {
 }
 
 - (void)emitSummaryIfNeeded {
+    if (!LGDebugLoggingEnabled()) return;
     CFTimeInterval now = CACurrentMediaTime();
     if (now - self.sampleStart < 2.0) return;
     LGClockLog(@"perf host=%@ layouts=%lu applies=%lu skips=%lu total_ms=%.3f peak_ms=%.3f",
@@ -1431,6 +1470,7 @@ static void LGClockSourceFontDidChange(UILabel *label, UIFont *candidate, NSStri
     }
 
     LGClockState *state = LGClockStateForHost(host, YES);
+    if (state.sourceLabel && label != state.sourceLabel) return;
     UIFont *associatedFont = objc_getAssociatedObject(label, kLGClockOriginalFontKey);
     if (LGDebugLoggingEnabled())
         LGClockLog(@"font event reason=%@ label=%p host=%p window=%@ enabled=%d variable=%d applying=%d sourceMatch=%d text=%@ candidate={%@} direct={%@} attributed={%@} stateCached={%@} associatedCached={%@} glass=%p alpha=%.2f hidden=%d stack=%@",
@@ -1556,6 +1596,10 @@ static void LGClockReconcilePreferenceReload(void) {
         [state restore];
         if (LGClockIsLegacyHost(host)) LGClockPositionLegacyDateSubtitle(host);
     }
+    LGClockRefreshWindows();
+    for (UIView *listView in LGClockLegacyNotificationViews().allObjects) {
+        LGClockRelayoutLegacyNotificationList(listView);
+    }
 }
 
 static void LGClockObstacleDidChange(UIView *view) {
@@ -1671,6 +1715,7 @@ static void LGPublishArtworkRect(UIView *artworkView) {
 %hook UILabel
 - (void)setText:(NSString *)text {
     %orig(text);
+    if (!LGClockDateFormatEnabled() && !LGClockIsLegacySystem()) return;
     if (LGClockIsDateLabel((UIView *)self)) {
         LGClockApplyDateText((UILabel *)self);
         return;
@@ -1682,6 +1727,7 @@ static void LGPublishArtworkRect(UIView *artworkView) {
 }
 - (void)setAttributedText:(NSAttributedString *)text {
     %orig(text);
+    if (!LGClockDateFormatEnabled() && !LGClockIsLegacySystem()) return;
     if (LGClockIsDateLabel((UIView *)self)) {
         LGClockApplyDateText((UILabel *)self);
         return;

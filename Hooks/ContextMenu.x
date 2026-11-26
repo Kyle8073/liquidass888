@@ -74,9 +74,15 @@ static BOOL ctxCellContextViewIsStock(UIView *view) {
 }
 
 static BOOL shouldRoundContextMenuSubview(UIView *view) {
-    if ([view isKindOfClass:NSClassFromString(@"LGCtxMenuGlowView")] ||
-        [view.superview isKindOfClass:NSClassFromString(@"LGCtxMenuGlowView")] ||
-        [view isKindOfClass:NSClassFromString(@"LGCtxMenuPillView")]) return NO;
+    static Class sGlowClass = Nil, sPillClass = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sGlowClass = NSClassFromString(@"LGCtxMenuGlowView");
+        sPillClass = NSClassFromString(@"LGCtxMenuPillView");
+    });
+    if ((sGlowClass && ([view isKindOfClass:sGlowClass] ||
+                        [view.superview isKindOfClass:sGlowClass])) ||
+        (sPillClass && [view isKindOfClass:sPillClass])) return NO;
     if (isExactClass(view, @"_UIContextMenuCellContextView"))
         return ctxCellContextViewIsStock(view);
     CGSize s = view.bounds.size;
@@ -215,14 +221,18 @@ static void injectGlassIntoContextEffectView(UIVisualEffectView *fx, int attempt
     // springboard sometimes gives us zero-ish bounds for a bit
     if (CGRectGetWidth(container.bounds) < 10.0 || CGRectGetHeight(container.bounds) < 10.0) {
         if (attempt >= 10) return;
+        __weak UIVisualEffectView *weakFx = fx;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (fx.window) injectGlassIntoContextEffectView(fx, attempt + 1);
+            UIVisualEffectView *strongFx = weakFx;
+            if (strongFx.window && lgHostEnabled(@"ContextMenu"))
+                injectGlassIntoContextEffectView(strongFx, attempt + 1);
         });
         return;
     }
 
     LGLiveBackdropView *glass = objc_getAssociatedObject(fx, kCtxGlassKey);
+    BOOL fresh = (glass == nil);
     if (!glass) {
         glass = LGCreateRegisteredGlass(container.bounds, nil, @"ContextMenu");
         if (!glass) return;
@@ -231,18 +241,29 @@ static void injectGlassIntoContextEffectView(UIVisualEffectView *fx, int attempt
         objc_setAssociatedObject(fx, kCtxGlassKey, glass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     if (glass.superview != container) [container insertSubview:glass atIndex:0];
-    glass.frame                = contextMenuVisualBounds(container);
-    glass.layer.cornerRadius   = contextMenuCornerRadius();
-    glass.layer.cornerCurve    = kCACornerCurveContinuous;
-    glass.layer.masksToBounds  = YES;
-    [glass applyFilters];
+    CGRect targetFrame = contextMenuVisualBounds(container);
+    if (!CGRectEqualToRect(glass.frame, targetFrame)) glass.frame = targetFrame;
+    CGFloat cornerRadius = contextMenuCornerRadius();
+    if (fabs(glass.layer.cornerRadius - cornerRadius) > 0.01)
+        glass.layer.cornerRadius = cornerRadius;
+    if (@available(iOS 13.0, *)) {
+        if (glass.layer.cornerCurve != kCACornerCurveContinuous)
+            glass.layer.cornerCurve = kCACornerCurveContinuous;
+    }
+    if (!glass.layer.masksToBounds) glass.layer.masksToBounds = YES;
+    if (fresh || !glass.lgFilterAttached) [glass applyFilters];
     if (LGDebugLoggingEnabled() && ![objc_getAssociatedObject(fx, kCtxGlassProbeKey) boolValue]) {
         objc_setAssociatedObject(fx, kCtxGlassProbeKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        __weak UIVisualEffectView *weakFx = fx;
+        __weak LGLiveBackdropView *weakGlass = glass;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            objc_setAssociatedObject(fx, kCtxGlassProbeKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            UIVisualEffectView *strongFx = weakFx;
+            LGLiveBackdropView *strongGlass = weakGlass;
+            if (!strongFx) return;
+            objc_setAssociatedObject(strongFx, kCtxGlassProbeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             LGLog(@"[ContextMenu glass probe] fx=%@ frame=%@ bounds=%@ content=%@ glass=%@ container=%@ containerBounds=%@",
-                  NSStringFromClass(fx.class), NSStringFromCGRect(fx.frame), NSStringFromCGRect(fx.bounds),
-                  NSStringFromCGRect(container.frame), NSStringFromCGRect(glass.frame),
+                  NSStringFromClass(strongFx.class), NSStringFromCGRect(strongFx.frame), NSStringFromCGRect(strongFx.bounds),
+                  NSStringFromCGRect(container.frame), NSStringFromCGRect(strongGlass.frame),
                   NSStringFromClass(container.superview.class), NSStringFromCGRect(container.superview.bounds));
         });
     }
@@ -252,17 +273,28 @@ static void removeGlassFromContextEffectView(UIVisualEffectView *fx) {
     LGLiveBackdropView *glass = objc_getAssociatedObject(fx, kCtxGlassKey);
     if (!glass) return;
     [glass removeFromSuperview];
-    objc_setAssociatedObject(fx, kCtxGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(fx, kCtxGlassKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void LGCollectContextImageViews(UIView *root, NSMutableArray<UIImageView *> *out) {
+    for (UIView *sub in root.subviews) {
+        if ([sub isKindOfClass:[UIImageView class]]) {
+            UIImageView *iv = (UIImageView *)sub;
+            if (iv.image && iv.bounds.size.width > 8.0 && iv.bounds.size.height > 8.0) {
+                [out addObject:iv];
+            }
+        }
+        LGCollectContextImageViews(sub, out);
+    }
 }
 
 static void relayoutContextMenuCellContent(UIView *contentView) {
-    if (contentView.bounds.size.width < 40.0 || contentView.bounds.size.height < 20.0) return;
+    CGFloat width = contentView.bounds.size.width;
+    CGFloat height = contentView.bounds.size.height;
+    if (width < 40.0 || height < 20.0) return;
 
-    UIImageView *iconView = (UIImageView *)findDescendantMatching(contentView, ^BOOL(UIView *v) {
-        if (![v isKindOfClass:[UIImageView class]]) return NO;
-        UIImageView *iv = (UIImageView *)v;
-        return iv.image && iv.bounds.size.width > 8.0 && iv.bounds.size.height > 8.0;
-    });
+    NSMutableArray<UIImageView *> *images = [NSMutableArray array];
+    LGCollectContextImageViews(contentView, images);
     UIView *textView = findDescendantMatching(contentView, ^BOOL(UIView *v) {
         if ([v isKindOfClass:[UIStackView class]]) {
             for (UIView *sub in v.subviews)
@@ -270,25 +302,57 @@ static void relayoutContextMenuCellContent(UIView *contentView) {
         }
         return [v isKindOfClass:[UILabel class]];
     });
-    if (!textView || textView == (UIView *)iconView) return;
+    if (!textView || !images.count) return;
 
+    BOOL isRTL = NO;
+    if (@available(iOS 9.0, *)) {
+        isRTL = contentView.effectiveUserInterfaceLayoutDirection == UIUserInterfaceLayoutDirectionRightToLeft;
+    }
+
+    UIImageView *iconView = nil;
+    UIImageView *trailingAccessory = nil;
+    for (UIImageView *iv in images) {
+        if ((UIView *)iv == textView) continue;
+        CGRect rect = [iv convertRect:iv.bounds toView:contentView];
+        CGFloat midX = CGRectGetMidX(rect);
+        BOOL inLeadingHalf = isRTL ? (midX > width * 0.5) : (midX < width * 0.5);
+        if (inLeadingHalf) {
+            if (!iconView) iconView = iv;
+        } else {
+            if (!trailingAccessory) trailingAccessory = iv;
+        }
+    }
     if (!iconView) return;
 
-    CGFloat iconY = round((contentView.bounds.size.height - kCtxIconSize) * 0.5);
-    ctxRememberFrame(iconView);
-    if (!objc_getAssociatedObject(iconView, kCtxOriginalContentModeKey))
-        objc_setAssociatedObject(iconView, kCtxOriginalContentModeKey, @(iconView.contentMode), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    iconView.contentMode = UIViewContentModeScaleAspectFit;
-    iconView.frame = CGRectMake(kCtxRowInset, iconY, kCtxIconSize, kCtxIconSize);
+    CGFloat iconY = round((height - kCtxIconSize) * 0.5);
+    CGFloat iconX = isRTL ? (width - kCtxRowInset - kCtxIconSize) : kCtxRowInset;
+    CGRect targetIconFrame = CGRectMake(iconX, iconY, kCtxIconSize, kCtxIconSize);
+    if (!CGRectEqualToRect(iconView.frame, targetIconFrame)) {
+        ctxRememberFrame(iconView);
+        if (!objc_getAssociatedObject(iconView, kCtxOriginalContentModeKey))
+            objc_setAssociatedObject(iconView, kCtxOriginalContentModeKey, @(iconView.contentMode), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        iconView.contentMode = UIViewContentModeScaleAspectFit;
+        iconView.frame = targetIconFrame;
+    }
+
+    CGFloat leadingReserve = kCtxRowInset + kCtxIconSize + kCtxIconSpacing;
+    CGFloat trailingReserve = kCtxRowInset;
+    if (trailingAccessory) {
+        CGRect accRect = [trailingAccessory convertRect:trailingAccessory.bounds toView:contentView];
+        trailingReserve = MAX(kCtxRowInset,
+                              (isRTL ? CGRectGetMaxX(accRect) : (width - CGRectGetMinX(accRect))) + 8.0);
+    }
+    CGFloat maxWidth = width - leadingReserve - trailingReserve;
+    if (maxWidth < 20.0) return;
 
     CGRect textFrame = textView.frame;
-    CGFloat textX    = kCtxRowInset + kCtxIconSize + kCtxIconSpacing;
-    CGFloat maxWidth = contentView.bounds.size.width - textX - kCtxRowInset;
-    if (maxWidth < 20.0) return;
-    textFrame.origin.x   = textX;
+    textFrame.origin.x = isRTL ? trailingReserve : leadingReserve;
     textFrame.size.width = maxWidth;
-    ctxRememberFrame(textView);
-    textView.frame = CGRectIntegral(textFrame);
+    CGRect integralText = CGRectIntegral(textFrame);
+    if (!CGRectEqualToRect(textView.frame, integralText)) {
+        ctxRememberFrame(textView);
+        textView.frame = integralText;
+    }
 }
 
 @interface LGCtxMenuGlowView : UIView
@@ -433,7 +497,7 @@ static LGCtxMenuPillView *contextMenuPillView(UIView *cell) {
 static void restoreContextMenuSubtree(UIView *view) {
     LGLiveBackdropView *glass = objc_getAssociatedObject(view, kCtxGlassKey);
     [glass removeFromSuperview];
-    objc_setAssociatedObject(view, kCtxGlassKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, kCtxGlassKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSNumber *alpha = objc_getAssociatedObject(view, kCtxOriginalAlphaKey);
     if (alpha) {
         view.alpha = alpha.doubleValue;
@@ -442,23 +506,24 @@ static void restoreContextMenuSubtree(UIView *view) {
         NSString *curve = objc_getAssociatedObject(view, kCtxOriginalCurveKey);
         view.layer.cornerCurve = curve.length ? curve : kCACornerCurveCircular;
         view.layer.masksToBounds = [objc_getAssociatedObject(view, kCtxOriginalMasksKey) boolValue];
-        objc_setAssociatedObject(view, kCtxOriginalAlphaKey, nil, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject(view, kCtxOriginalHiddenKey, nil, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject(view, kCtxOriginalRadiusKey, nil, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject(view, kCtxOriginalCurveKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(view, kCtxOriginalAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kCtxOriginalHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kCtxOriginalRadiusKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kCtxOriginalCurveKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kCtxOriginalMasksKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     NSValue *frame = objc_getAssociatedObject(view, kCtxOriginalFrameKey);
-    if (frame) { view.frame = frame.CGRectValue; objc_setAssociatedObject(view, kCtxOriginalFrameKey, nil, OBJC_ASSOCIATION_ASSIGN); }
+    if (frame) { view.frame = frame.CGRectValue; objc_setAssociatedObject(view, kCtxOriginalFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     NSNumber *contentMode = objc_getAssociatedObject(view, kCtxOriginalContentModeKey);
-    if (contentMode) { view.contentMode = contentMode.integerValue; objc_setAssociatedObject(view, kCtxOriginalContentModeKey, nil, OBJC_ASSOCIATION_ASSIGN); }
+    if (contentMode) { view.contentMode = contentMode.integerValue; objc_setAssociatedObject(view, kCtxOriginalContentModeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     UIColor *background = objc_getAssociatedObject(view, kCtxGapOriginalBgKey);
-    if (background) { view.backgroundColor = background; objc_setAssociatedObject(view, kCtxGapOriginalBgKey, nil, OBJC_ASSOCIATION_ASSIGN); }
+    if (background) { view.backgroundColor = background; objc_setAssociatedObject(view, kCtxGapOriginalBgKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
     UIView *divider = [view viewWithTag:kCtxDividerTag];
     [divider removeFromSuperview];
     [objc_getAssociatedObject(view, kCtxGlowViewKey) removeFromSuperview];
-    objc_setAssociatedObject(view, kCtxGlowViewKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, kCtxGlowViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [objc_getAssociatedObject(view, kCtxCellPillKey) removeFromSuperview];
-    objc_setAssociatedObject(view, kCtxCellPillKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(view, kCtxCellPillKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     for (UIView *sub in [view.subviews copy]) restoreContextMenuSubtree(sub);
 }
 
@@ -629,7 +694,10 @@ static void ctxScheduleLayoutProbe(UIView *listView) {
             frame.origin.y = kCtxContentInset;
             frame.size.width = MAX(0.0, CGRectGetWidth(collection.superview.bounds) -
                                          kCtxContentInset * 2.0);
-            collection.frame = frame;
+            if (!CGRectEqualToRect(collection.frame, frame)) {
+                ctxRememberFrame(collection);
+                collection.frame = frame;
+            }
             if (contextMenuNeedsLegacyInsetWorkaround()) {
                 for (UIView *view = collection.superview; view && view != (UIView *)self; view = view.superview) {
                     ctxRememberVisualState(view);
@@ -647,12 +715,13 @@ static void ctxScheduleLayoutProbe(UIView *listView) {
     %orig;
     if (!lgHostEnabled(@"ContextMenu") || !indexPath) return;
     UICollectionViewCell *cell = [self.collectionView cellForItemAtIndexPath:indexPath];
-    [contextMenuPillView(cell) setShowing:YES animated:YES];
+    if (cell) [contextMenuPillView(cell) setShowing:YES animated:YES];
 }
 - (void)unHighlightItemAtIndexPath:(NSIndexPath *)indexPath {
     %orig;
     if (!lgHostEnabled(@"ContextMenu") || !indexPath) return;
     UICollectionViewCell *cell = [self.collectionView cellForItemAtIndexPath:indexPath];
+    if (!cell) return;
     LGCtxMenuPillView *pill = objc_getAssociatedObject(cell, kCtxCellPillKey);
     [pill setShowing:NO animated:YES];
 }
@@ -683,8 +752,10 @@ static void ctxScheduleLayoutProbe(UIView *listView) {
     UICollectionViewLayoutAttributes *fitted = %orig;
     if (lgHostEnabled(@"ContextMenu")) {
         CGSize size = fitted.size;
-        size.height = kCtxRowHeight;
-        fitted.size = size;
+        if (size.height > 1.0 && size.height <= 48.0) {
+            size.height = kCtxRowHeight;
+            fitted.size = size;
+        }
     }
     return fitted;
 }
