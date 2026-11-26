@@ -1048,7 +1048,6 @@ lgClockMaskTexture(__unsafe_unretained id<MTLDevice> device,
 // radius and bezel scale from the shortest surface side
 
 static const float kCornerRadiusRatio = 28.0f / 220.0f;
-static const float kMaxBezelPx        = 34.0f;
 
 typedef struct {
     const char *typeName;
