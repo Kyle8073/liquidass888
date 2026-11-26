@@ -285,9 +285,9 @@ static void LG_closeSafeModeAlert(void) {
 static void LG_showSafeModeAlertIfNeeded(void) {
     BOOL pending = access(kLGSafeModePendingPath, F_OK) == 0;
     BOOL safeMode = LGBackboardSafeModeActive();
+    if ((!pending && !safeMode) || sLGSafeModeAlertWindow) return;
     LG_safeModeAlertLog(@"show requested pending=%d safeMode=%d existing=%@",
                         pending, safeMode, sLGSafeModeAlertWindow);
-    if ((!pending && !safeMode) || sLGSafeModeAlertWindow) return;
 
     if (pending && !sLGSavedDiagnosticsThisLaunch) {
         sLGSavedDiagnosticsThisLaunch = YES;
@@ -367,14 +367,16 @@ static void LG_showSafeModeAlertIfNeeded(void) {
     }]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        LG_safeModeAlertLog(@"presentation check rootWindow=%@ overlay=%@ expected=%@",
-                            root.view.window, sLGSafeModeAlertWindow, window);
-        if (!root.view.window || sLGSafeModeAlertWindow != window) {
+        UIViewController *presenter = LG_topPresentedController(root);
+        LG_safeModeAlertLog(@"presentation check rootWindow=%@ presenter=%@ overlay=%@ expected=%@",
+                            root.view.window, presenter, sLGSafeModeAlertWindow, window);
+        if (!presenter.view.window || presenter.presentedViewController ||
+            sLGSafeModeAlertWindow != window) {
             LG_safeModeAlertLog(@"presentation aborted");
             LG_closeSafeModeAlert();
             return;
         }
-        [root presentViewController:alert animated:YES completion:^{
+        [presenter presentViewController:alert animated:YES completion:^{
             LG_safeModeAlertLog(@"presentation completed alertWindow=%@ alertViewWindow=%@ frame=%@",
                                 alert.view.window, alert.view.window,
                                 NSStringFromCGRect(alert.view.frame));
