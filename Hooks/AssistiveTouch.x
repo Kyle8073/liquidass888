@@ -558,11 +558,7 @@ static void LGAssistiveTouchTeardownRocker(HNDRocker *rocker) {
         ];
         anim.removedOnCompletion = YES;
         __weak HNDRocker *weakSelf = self;
-        if (backdrop && !objc_getAssociatedObject(self, kAssBackdropAlphaKey)) {
-        objc_setAssociatedObject(self, kAssBackdropAlphaKey, @(backdrop.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    [CATransaction begin];
+        [CATransaction begin];
         [CATransaction setCompletionBlock:^{
             HNDRocker *strongSelf = weakSelf;
             if (!strongSelf) return;
