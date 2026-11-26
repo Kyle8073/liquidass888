@@ -3,6 +3,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import "../Shared/LGSharedSupport.h"
 
 static BOOL kIsEnabled = YES;
@@ -12,6 +13,7 @@ static BOOL kForceDarkMode = YES;
 static CGFloat kMaxWidgetWidth = 140.0;
 static CGFloat kMaxWidgetHeight = 140.0;
 static NSSet<NSString *> *kWidgetBundleIdentifiers = nil;
+static os_unfair_lock sRWBPrefsLock = OS_UNFAIR_LOCK_INIT;
 
 static NSArray<NSString *> *RWBParseThirdPartyBundleIDs(NSString *rawText) {
     if (![rawText isKindOfClass:[NSString class]] || rawText.length == 0) return @[];
@@ -28,13 +30,7 @@ static NSArray<NSString *> *RWBParseThirdPartyBundleIDs(NSString *rawText) {
 
 static void ReloadPrefs(void) {
     LGReloadPreferences();
-    kIsEnabled = LG_globalEnabled() && LG_prefBool(@"Widgets.Enabled", YES);
-    kIsEnabledForSystemWidgets = YES;
-    kIsEnabledForMaterialView = NO;
-    kForceDarkMode = YES;
-    kMaxWidgetWidth = 140.0;
-    kMaxWidgetHeight = 140.0;
-
+    BOOL enabled = LG_globalEnabled() && LG_prefBool(@"Widgets.Enabled", YES);
     NSString *configuredBundleIDs =
         LGHasExplicitPreferenceValue(@"RWB.ThirdPartyBundleIDs")
             ? LG_prefString(@"RWB.ThirdPartyBundleIDs", @"")
@@ -42,7 +38,17 @@ static void ReloadPrefs(void) {
     NSMutableOrderedSet<NSString *> *bundleIDs =
         [NSMutableOrderedSet orderedSetWithArray:
             RWBParseThirdPartyBundleIDs(configuredBundleIDs)];
-    kWidgetBundleIdentifiers = [NSSet setWithArray:bundleIDs.array];
+    NSSet<NSString *> *nextSet = [NSSet setWithArray:bundleIDs.array];
+
+    os_unfair_lock_lock(&sRWBPrefsLock);
+    kIsEnabled = enabled;
+    kIsEnabledForSystemWidgets = YES;
+    kIsEnabledForMaterialView = NO;
+    kForceDarkMode = YES;
+    kMaxWidgetWidth = 140.0;
+    kMaxWidgetHeight = 140.0;
+    kWidgetBundleIdentifiers = nextSet;
+    os_unfair_lock_unlock(&sRWBPrefsLock);
 }
 
 static void RWBReloadPrefsCallback(CFNotificationCenterRef __unused center,
@@ -93,7 +99,11 @@ static void RWBReloadPrefsCallback(CFNotificationCenterRef __unused center,
 @end
 
 static BOOL ShouldHandleWidget(NSString *bundleIdentifier) {
-    return kIsEnabled && bundleIdentifier.length > 0 && [kWidgetBundleIdentifiers containsObject:bundleIdentifier];
+    if (!kIsEnabled || bundleIdentifier.length == 0) return NO;
+    os_unfair_lock_lock(&sRWBPrefsLock);
+    BOOL matched = [kWidgetBundleIdentifiers containsObject:bundleIdentifier];
+    os_unfair_lock_unlock(&sRWBPrefsLock);
+    return matched;
 }
 
 %group RWBSpringBoard
@@ -183,19 +193,20 @@ static BOOL ShouldHandleWidget(NSString *bundleIdentifier) {
 %property (nonatomic, strong) NSNumber *rwb_shouldHideBackground;
 
 - (UIWindow *)initWithWindowScene:(UIWindowScene *)scene {
+    UIWindow *window = %orig;
+    if (!window) return nil;
     if ([scene isKindOfClass:%c(CHUISAvocadoWindowScene)]) {
         CHUISAvocadoWindowScene *avocadoScene = (CHUISAvocadoWindowScene *)scene;
         if (ShouldHandleWidget(avocadoScene.widget.extensionBundleIdentifier)) {
-            self.rwb_shouldHideBackground = @YES;
+            window.rwb_shouldHideBackground = @YES;
         }
     } else if ([scene isKindOfClass:%c(CHUISWidgetScene)]) {
         CHUISWidgetScene *widgetScene = (CHUISWidgetScene *)scene;
         if (ShouldHandleWidget(widgetScene.widget.extensionBundleIdentifier)) {
-            self.rwb_shouldHideBackground = @YES;
+            window.rwb_shouldHideBackground = @YES;
         }
     }
-    UIWindow *window = %orig;
-    if (window && kIsEnabled && kForceDarkMode) {
+    if (kIsEnabled && kForceDarkMode) {
         [window setOverrideUserInterfaceStyle:UIUserInterfaceStyleDark];
     }
     return window;
@@ -234,7 +245,8 @@ static BOOL ShouldHandleWidget(NSString *bundleIdentifier) {
 
 - (void)layoutSubviews {
     %orig;
-    if (!kIsEnabled) return;
+    if (!kIsEnabled || !self.window || !self.window.rwb_shouldHideBackground.boolValue) return;
+    if (!self.backgroundColor || self.backgroundColor == UIColor.clearColor) return;
     if (![NSStringFromClass([self class]) containsString:@"UIHostingView"]) {
         self.backgroundColor = UIColor.clearColor;
     }
@@ -254,13 +266,15 @@ static BOOL ShouldHandleWidget(NSString *bundleIdentifier) {
             if (self.opaque) self.opaque = NO;
         }
 
-        %orig;
-
-        [threadDict removeObjectForKey:@"rwb_shouldHideBackground"];
-        if (@available(iOS 17, *)) {
-            [threadDict removeObjectForKey:@"rwb_didSkipFirstN"];
-        } else {
-            [threadDict removeObjectForKey:@"rwb_didSkipFirst"];
+        @try {
+            %orig;
+        } @finally {
+            [threadDict removeObjectForKey:@"rwb_shouldHideBackground"];
+            if (@available(iOS 17, *)) {
+                [threadDict removeObjectForKey:@"rwb_didSkipFirstN"];
+            } else {
+                [threadDict removeObjectForKey:@"rwb_didSkipFirst"];
+            }
         }
         return;
     }
@@ -351,7 +365,6 @@ static BOOL ShouldHandleWidget(NSString *bundleIdentifier) {
 
 %ctor {
     ReloadPrefs();
-    if (!kIsEnabled) return;
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
